@@ -1,0 +1,299 @@
+{
+  "data": [
+    {
+      "traceID": "7282b812788d59aad12f61c8d2d271c3",
+      "spans": [
+        {
+          "traceID": "7282b812788d59aad12f61c8d2d271c3",
+          "spanID": "e43f8ce78a35c5ec",
+          "operationName": "activity.runCodexAppServerTurn",
+          "references": [
+            {
+              "refType": "CHILD_OF",
+              "traceID": "7282b812788d59aad12f61c8d2d271c3",
+              "spanID": "ef5d99e41450eb48"
+            }
+          ],
+          "startTime": 1792134900690000,
+          "duration": 2000,
+          "tags": [
+            {
+              "key": "error",
+              "type": "bool",
+              "value": true
+            },
+            {
+              "key": "otel.scope.name",
+              "type": "string",
+              "value": "space-worker"
+            },
+            {
+              "key": "otel.status_code",
+              "type": "string",
+              "value": "ERROR"
+            },
+            {
+              "key": "space.failure_category",
+              "type": "string",
+              "value": "INTERNAL"
+            },
+            {
+              "key": "space.outcome",
+              "type": "string",
+              "value": "FAILED"
+            },
+            {
+              "key": "space.pane_id",
+              "type": "string",
+              "value": "pane:Tf8Og07X1DbT"
+            },
+            {
+              "key": "space.reason_code",
+              "type": "string",
+              "value": "ACTIVITY_ERROR"
+            },
+            {
+              "key": "space.room_id",
+              "type": "string",
+              "value": "room:CN2IHXq40MRi"
+            },
+            {
+              "key": "span.kind",
+              "type": "string",
+              "value": "internal"
+            },
+            {
+              "key": "temporal.activity.attempt",
+              "type": "int64",
+              "value": 1
+            },
+            {
+              "key": "temporal.activity.id",
+              "type": "string",
+              "value": "1"
+            },
+            {
+              "key": "temporal.activity.type",
+              "type": "string",
+              "value": "runCodexAppServerTurn"
+            },
+            {
+              "key": "temporal.run.id",
+              "type": "string",
+              "value": "ef9fbbda-8b96-4313-8bcc-4a188582fd9e"
+            },
+            {
+              "key": "temporal.workflow.id",
+              "type": "string",
+              "value": "workflow:codex-app-server:room:CN2IHXq40MRi:pane:Tf8Og07X1DbT:req:9aICQc4K6cqW"
+            },
+            {
+              "key": "temporal.workflow.type",
+              "type": "string",
+              "value": "codexAppServerTurnWorkflow"
+            }
+          ],
+          "logs": [],
+          "processID": "p1",
+          "warnings": null
+        },
+        {
+          "traceID": "7282b812788d59aad12f61c8d2d271c3",
+          "spanID": "aa976df8e79a9ad6",
+          "operationName": "activity.runCodexAppServerTurn",
+          "references": [
+            {
+              "refType": "CHILD_OF",
+              "traceID": "7282b812788d59aad12f61c8d2d271c3",
+              "spanID": "ef5d99e41450eb48"
+            }
+          ],
+          "startTime": 1792134900704000,
+          "duration": 1000,
+          "tags": [
+            {
+              "key": "otel.scope.name",
+              "type": "string",
+              "value": "space-worker"
+            },
+            {
+              "key": "space.outcome",
+              "type": "string",
+              "value": "COMPLETED"
+            },
+            {
+              "key": "space.pane_id",
+              "type": "string",
+              "value": "pane:Tf8Og07X1DbT"
+            },
+            {
+              "key": "space.room_id",
+              "type": "string",
+              "value": "room:CN2IHXq40MRi"
+            },
+            {
+              "key": "span.kind",
+              "type": "string",
+              "value": "internal"
+            },
+            {
+              "key": "temporal.activity.attempt",
+              "type": "int64",
+              "value": 2
+            },
+            {
+              "key": "temporal.activity.id",
+              "type": "string",
+              "value": "1"
+            },
+            {
+              "key": "temporal.activity.type",
+              "type": "string",
+              "value": "runCodexAppServerTurn"
+            },
+            {
+              "key": "temporal.run.id",
+              "type": "string",
+              "value": "ef9fbbda-8b96-4313-8bcc-4a188582fd9e"
+            },
+            {
+              "key": "temporal.workflow.id",
+              "type": "string",
+              "value": "workflow:codex-app-server:room:CN2IHXq40MRi:pane:Tf8Og07X1DbT:req:9aICQc4K6cqW"
+            },
+            {
+              "key": "temporal.workflow.type",
+              "type": "string",
+              "value": "codexAppServerTurnWorkflow"
+            }
+          ],
+          "logs": [],
+          "processID": "p1",
+          "warnings": null
+        },
+        {
+          "traceID": "7282b812788d59aad12f61c8d2d271c3",
+          "spanID": "ef5d99e41450eb48",
+          "operationName": "workflow.codexAppServerTurnWorkflow",
+          "references": [
+            {
+              "refType": "CHILD_OF",
+              "traceID": "7282b812788d59aad12f61c8d2d271c3",
+              "spanID": "7f5018c18a70f6c1"
+            }
+          ],
+          "startTime": 1792134899799000,
+          "duration": 1909000,
+          "tags": [
+            {
+              "key": "otel.scope.name",
+              "type": "string",
+              "value": "space-worker"
+            },
+            {
+              "key": "space.outcome",
+              "type": "string",
+              "value": "COMPLETED"
+            },
+            {
+              "key": "space.pane_id",
+              "type": "string",
+              "value": "pane:Tf8Og07X1DbT"
+            },
+            {
+              "key": "space.room_id",
+              "type": "string",
+              "value": "room:CN2IHXq40MRi"
+            },
+            {
+              "key": "space.trace_id",
+              "type": "string",
+              "value": "req:9aICQc4K6cqW"
+            },
+            {
+              "key": "span.kind",
+              "type": "string",
+              "value": "internal"
+            },
+            {
+              "key": "temporal.run.id",
+              "type": "string",
+              "value": "ef9fbbda-8b96-4313-8bcc-4a188582fd9e"
+            },
+            {
+              "key": "temporal.workflow.id",
+              "type": "string",
+              "value": "workflow:codex-app-server:room:CN2IHXq40MRi:pane:Tf8Og07X1DbT:req:9aICQc4K6cqW"
+            },
+            {
+              "key": "temporal.workflow.type",
+              "type": "string",
+              "value": "codexAppServerTurnWorkflow"
+            }
+          ],
+          "logs": [],
+          "processID": "p1",
+          "warnings": null
+        },
+        {
+          "traceID": "7282b812788d59aad12f61c8d2d271c3",
+          "spanID": "7f5018c18a70f6c1",
+          "operationName": "POST /api/turns",
+          "references": [],
+          "startTime": 1792134899779229,
+          "duration": 26429,
+          "tags": [
+            {
+              "key": "http.request.method",
+              "type": "string",
+              "value": "POST"
+            },
+            {
+              "key": "http.response.status_code",
+              "type": "int64",
+              "value": 200
+            },
+            {
+              "key": "http.route",
+              "type": "string",
+              "value": "/api/turns"
+            },
+            {
+              "key": "otel.scope.name",
+              "type": "string",
+              "value": "space-api"
+            },
+            {
+              "key": "space.request_id",
+              "type": "string",
+              "value": "req:9aICQc4K6cqW"
+            },
+            {
+              "key": "span.kind",
+              "type": "string",
+              "value": "server"
+            }
+          ],
+          "logs": [],
+          "processID": "p2",
+          "warnings": null
+        }
+      ],
+      "processes": {
+        "p1": {
+          "serviceName": "space-worker-api-proof",
+          "tags": []
+        },
+        "p2": {
+          "serviceName": "space-api",
+          "tags": []
+        }
+      },
+      "warnings": null
+    }
+  ],
+  "total": 0,
+  "limit": 0,
+  "offset": 0,
+  "errors": null
+}
