@@ -1,0 +1,151 @@
+name: PR 67 current-main validation
+
+on:
+  push:
+    branches:
+      - codex/source-quality-pr67-cp377
+    paths:
+      - .github/workflows/source-quality-pr67-cp377.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: source-quality-pr67-cp377
+  cancel-in-progress: false
+
+jobs:
+  current-main-validation:
+    if: >-
+      github.repository == 'pythonyx135793/spaceapp' &&
+      github.event.repository.private == false &&
+      github.ref == 'refs/heads/codex/source-quality-pr67-cp377'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+      NO_COLOR: '1'
+    steps:
+      - name: Check out exact reviewed candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: pythonyx135793/spaceapp
+          ref: bbc656d83ef9c924f842578a2b02be575ee65cc6
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Verify immutable clean source
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = 'bbc656d83ef9c924f842578a2b02be575ee65cc6'
+          test "$(git rev-parse HEAD:packages/codex-app-server/src/socket-path-recovery.ts)" = '95441af3378a2a94da9e1ebe747aaeb975303b60'
+          test -z "$(git status --porcelain)"
+
+      - name: Use source-required Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .nvmrc
+
+      - name: Verify environment and required tooling
+        shell: bash
+        run: |
+          test "$(node --version)" = "v$(tr -d '\r\n' < .nvmrc)"
+          test "$(npm --version)" = '10.9.8'
+          printf 'ImageOS=%s ImageVersion=%s CI=%s\n' "$ImageOS" "$ImageVersion" "$CI"
+          uname -a
+          node --version
+          npm --version
+          if ! command -v rg >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq --no-install-recommends ripgrep
+          fi
+          rg --version
+
+      - name: Install locked dependencies
+        id: install
+        run: npm ci --no-audit --no-fund
+
+      - name: Prove the new lifecycle regression rejects the old guard
+        shell: bash
+        run: |
+          path=packages/codex-app-server/src/socket-path-recovery.ts
+          trap 'git restore --source=HEAD -- "$path"' EXIT
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('packages/codex-app-server/src/socket-path-recovery.ts')
+          source = path.read_text()
+          old = 'if (stopped || !server.listening) return;'
+          assert source.count(old) == 1
+          path.write_text(source.replace(old, 'if (stopped) return;'))
+          PY
+          set +e
+          npm test -w @space/codex-app-server -- tests/socket-path-recovery.test.ts --reporter=json --outputFile="$RUNNER_TEMP/socket-baseline.json"
+          baseline_status=$?
+          set -e
+          test "$baseline_status" -ne 0
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          result = json.loads((Path(os.environ['RUNNER_TEMP']) / 'socket-baseline.json').read_text())
+          assert result['numFailedTests'] == 2, result
+          assert result['numPassedTests'] == 1, result
+          tests = [test for file in result['testResults'] for test in file['assertionResults']]
+          failed = [test for test in tests if test['status'] == 'failed']
+          assert len(tests) == 3 and len(failed) == 2
+          assert {test['title'] for test in failed} == {
+              'does not reopen an intentionally closed listener while lstat is pending',
+              'does not reopen an intentionally closed listener while chmod is pending'}
+          assert all('not be called at all' in '\n'.join(test['failureMessages']) for test in failed)
+          print('Expected negative control: both delayed-filesystem close regressions fail; live-recovery control passes.')
+          PY
+          git restore --source=HEAD -- "$path"
+          trap - EXIT
+          test -z "$(git status --porcelain)"
+
+      - name: Focused lifecycle regression on exact candidate
+        run: npm test -w @space/codex-app-server -- tests/socket-path-recovery.test.ts
+
+      - name: Full check
+        id: check
+        run: npm run check
+
+      - name: One full-root test invocation on exact candidate
+        id: test
+        shell: bash
+        run: |
+          set -o pipefail
+          npm test 2>&1 | tee "$RUNNER_TEMP/full-root-test.log"
+
+      - name: Confirm sandbox duration from the full-root run
+        if: ${{ !cancelled() && steps.test.outcome == 'success' }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os, re
+          from pathlib import Path
+          text = (Path(os.environ['RUNNER_TEMP']) / 'full-root-test.log').read_text()
+          text = re.sub(r'\x1b\[[0-9;]*m', '', text)
+          matches = re.findall(r'tests/temporal-sandbox.integration.test\.ts \(23 tests\)\s+(\d+)ms', text)
+          assert len(matches) == 1, matches
+          milliseconds = int(matches[0])
+          assert milliseconds < 180000, milliseconds
+          summary = f'Exact candidate full-root run: sandbox/replay 23 tests passed in {milliseconds} ms (file wall time).\n'
+          print(summary)
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as file:
+              file.write(summary)
+          PY
+
+      - name: Full build
+        id: build
+        if: ${{ !cancelled() && steps.check.outcome == 'success' }}
+        run: npm run build
+
+      - name: Hygiene and immutable-source readback
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        shell: bash
+        run: |
+          npm run hygiene:preflight
+          test "$(git rev-parse HEAD)" = 'bbc656d83ef9c924f842578a2b02be575ee65cc6'
+          test -z "$(git status --porcelain)"
+          git diff --check
+          printf 'No retries, no test-hook instrumentation, no assertion or timeout changes. Original failures remain historical evidence; the guard regression does not prove their cause.\n' >> "$GITHUB_STEP_SUMMARY"
