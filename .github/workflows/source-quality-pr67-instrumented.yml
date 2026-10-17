@@ -1,0 +1,118 @@
+name: PR 67 full-root cleanup diagnosis
+
+on:
+  push:
+    branches:
+      - codex/source-quality-pr67-instrumented-20261017
+    paths:
+      - .github/workflows/source-quality-pr67-instrumented.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: source-quality-pr67-instrumented-20261017
+  cancel-in-progress: false
+
+jobs:
+  head-root-diagnostic:
+    if: >-
+      github.repository == 'pythonyx135793/spaceapp' &&
+      github.event.repository.private == false &&
+      github.ref == 'refs/heads/codex/source-quality-pr67-instrumented-20261017'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+    steps:
+      - name: Check out exact PR source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: pythonyx135793/spaceapp
+          ref: 88fd3eed2f513ca4c140df73f00c624075ff91dd
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Verify immutable source and add diagnostic-only logging
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = '88fd3eed2f513ca4c140df73f00c624075ff91dd'
+          test -z "$(git status --porcelain)"
+          test "$(git rev-parse HEAD:packages/codex-app-server/tests/socket-multiplexer.test.ts)" = 'be1e7da71e288807070ab52dd0fa229534db827d'
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('packages/codex-app-server/tests/socket-multiplexer.test.ts')
+          source = path.read_text()
+          old = '  await Promise.all(cleanups.splice(0).map((cleanup) => cleanup()));'
+          new = '''  const pending = cleanups.splice(0).map((cleanup) => cleanup());
+            const completion = Promise.all(pending);
+            const startedAt = performance.now();
+            pending.forEach((promise, index) => {
+              const log = (phase: string) => {
+                try {
+                  console.error(`[cleanup-promise diagnostic] index=${index} phase=${phase} elapsedMs=${Math.round(performance.now() - startedAt)}`);
+                } catch {
+                  // Diagnostic logging must not change cleanup settlement.
+                }
+              };
+              log("observe");
+              void promise.then(
+                () => log("fulfilled"),
+                () => log("rejected")
+              );
+            });
+            await completion;'''
+          assert source.count(old) == 1, 'exact original cleanup hook must occur once'
+          path.write_text(source.replace(old, new))
+          PY
+          test "$(git diff --name-only)" = 'packages/codex-app-server/tests/socket-multiplexer.test.ts'
+          git diff --check
+          git diff -- packages/codex-app-server/tests/socket-multiplexer.test.ts
+          printf 'Diagnostic source: 88fd3eed2f513ca4c140df73f00c624075ff91dd plus the logging-only hook diff above. Original concurrent cleanup, assertions and 10-second timeout remain. This is NOT unchanged-source passing evidence. Instrumentation may alter timing.\n' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Use source-required Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .nvmrc
+
+      - name: Verify environment and required tooling
+        shell: bash
+        run: |
+          test "$(node --version)" = 'v22.23.0'
+          test "$(npm --version)" = '10.9.8'
+          printf 'ImageOS=%s ImageVersion=%s CI=%s ELECTRON_SKIP_BINARY_DOWNLOAD=%s\n' "$ImageOS" "$ImageVersion" "$CI" "$ELECTRON_SKIP_BINARY_DOWNLOAD"
+          uname -a
+          node --version
+          npm --version
+          if ! command -v rg >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq --no-install-recommends ripgrep
+          fi
+          rg --version
+
+      - name: Install locked dependencies
+        id: install
+        run: npm ci --no-audit --no-fund
+
+      - name: Full check before diagnostic test
+        id: check
+        run: npm run check
+
+      - name: One full-root diagnostic test invocation
+        id: test
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: npm test
+
+      - name: Confirm diagnostic scope and record all outcomes
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          INSTALL_OUTCOME: ${{ steps.install.outcome }}
+          CHECK_OUTCOME: ${{ steps.check.outcome }}
+          TEST_OUTCOME: ${{ steps.test.outcome }}
+        run: |
+          printf '\nDiagnostic only: install=%s; check=%s; single full-root test=%s. Original failures remain preserved; inspect actual counts and skips in this run. No automatic retries and no unchanged-source pass claim.\n' "$INSTALL_OUTCOME" "$CHECK_OUTCOME" "$TEST_OUTCOME" >> "$GITHUB_STEP_SUMMARY"
+          test "$(git rev-parse HEAD)" = '88fd3eed2f513ca4c140df73f00c624075ff91dd'
+          test "$(git diff --name-only)" = 'packages/codex-app-server/tests/socket-multiplexer.test.ts'
+          test -z "$(git ls-files --others --exclude-standard)"
+          git diff --check
