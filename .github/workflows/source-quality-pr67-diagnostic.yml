@@ -1,0 +1,172 @@
+name: PR 67 controlled teardown diagnosis
+
+on:
+  push:
+    branches:
+      - codex/source-quality-pr67-diagnostic-20261017
+    paths:
+      - .github/workflows/source-quality-pr67-diagnostic.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: source-quality-pr67-diagnostic-20261017
+  cancel-in-progress: false
+
+env:
+  ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+
+jobs:
+  base-root-control:
+    if: >-
+      github.repository == 'pythonyx135793/spaceapp' &&
+      github.event.repository.private == false &&
+      github.ref == 'refs/heads/codex/source-quality-pr67-diagnostic-20261017'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out unchanged PR base
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: pythonyx135793/spaceapp
+          ref: 8a3e1f00f1dc52a2ca0dff160e8520d6c2b2ab2e
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Verify and record base source
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = '8a3e1f00f1dc52a2ca0dff160e8520d6c2b2ab2e'
+          test -z "$(git status --porcelain)"
+          printf 'BASE tested commit: %s\nWorkflow commit: %s\n' "$(git rev-parse HEAD)" "$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Use source-required Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .nvmrc
+
+      - name: Record and constrain environment
+        shell: bash
+        run: |
+          test "$(node --version)" = 'v22.23.0'
+          test "$(npm --version)" = '10.9.8'
+          printf 'ImageOS=%s ImageVersion=%s CI=%s ELECTRON_SKIP_BINARY_DOWNLOAD=%s\n' "$ImageOS" "$ImageVersion" "$CI" "$ELECTRON_SKIP_BINARY_DOWNLOAD"
+          uname -a
+          node --version
+          npm --version
+          if ! command -v rg >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq --no-install-recommends ripgrep
+          fi
+          rg --version
+
+      - name: Install base locked dependencies
+        id: install
+        run: npm ci --no-audit --no-fund
+
+      - name: Unchanged base full root test once
+        id: root_test
+        run: npm test
+
+      - name: Record base control outcome
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          INSTALL_OUTCOME: ${{ steps.install.outcome }}
+          TEST_OUTCOME: ${{ steps.root_test.outcome }}
+        run: |
+          printf '\nBASE control: install=%s; full root npm test=%s. Counts and skips are in this attempt log.\n' "$INSTALL_OUTCOME" "$TEST_OUTCOME" >> "$GITHUB_STEP_SUMMARY"
+          test "$(git rev-parse HEAD)" = '8a3e1f00f1dc52a2ca0dff160e8520d6c2b2ab2e'
+          test -z "$(git status --porcelain)"
+
+  head-focused-repeats:
+    needs: base-root-control
+    if: >-
+      !cancelled() &&
+      github.repository == 'pythonyx135793/spaceapp' &&
+      github.event.repository.private == false &&
+      github.ref == 'refs/heads/codex/source-quality-pr67-diagnostic-20261017'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out unchanged PR head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: pythonyx135793/spaceapp
+          ref: 88fd3eed2f513ca4c140df73f00c624075ff91dd
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Verify and record head source
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = '88fd3eed2f513ca4c140df73f00c624075ff91dd'
+          test -z "$(git status --porcelain)"
+          printf 'HEAD tested commit: %s\nWorkflow commit: %s\n' "$(git rev-parse HEAD)" "$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Use source-required Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .nvmrc
+
+      - name: Record and constrain environment
+        shell: bash
+        run: |
+          test "$(node --version)" = 'v22.23.0'
+          test "$(npm --version)" = '10.9.8'
+          printf 'ImageOS=%s ImageVersion=%s CI=%s ELECTRON_SKIP_BINARY_DOWNLOAD=%s\n' "$ImageOS" "$ImageVersion" "$CI" "$ELECTRON_SKIP_BINARY_DOWNLOAD"
+          uname -a
+          node --version
+          npm --version
+
+      - name: Install head locked dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Build only the focused workspace prerequisite
+        run: npm run build -w @space/contracts
+
+      - name: Fixed three file attempts then three workspace attempts
+        id: focused_tests
+        shell: bash
+        run: |
+          had_failure=0
+          printf '\n| HEAD scope | Planned attempt | Actual exit code |\n| --- | --- | --- |\n' >> "$GITHUB_STEP_SUMMARY"
+          for scope in file workspace; do
+            for attempt in 1 2 3; do
+              printf '::group::HEAD %s attempt %s of 3\n' "$scope" "$attempt"
+              node --input-type=module -e 'import { readdir } from "node:fs/promises"; const names = (await readdir("/tmp")).filter(name => name.startsWith("space-codex-")); console.log(JSON.stringify({ diagnostic: "pre-attempt temporary directory inventory", count: names.length, names }));'
+              if [ "$scope" = 'file' ]; then
+                if npm test -w @space/codex-app-server -- tests/socket-multiplexer.test.ts; then
+                  attempt_code=0
+                else
+                  attempt_code=$?
+                fi
+              else
+                if npm test -w @space/codex-app-server; then
+                  attempt_code=0
+                else
+                  attempt_code=$?
+                fi
+              fi
+              printf '| %s | %s / 3 | %s |\n' "$scope" "$attempt" "$attempt_code" >> "$GITHUB_STEP_SUMMARY"
+              printf 'HEAD scope=%s attempt=%s exit_code=%s\n' "$scope" "$attempt" "$attempt_code"
+              printf '::endgroup::\n'
+              if [ "$attempt_code" -ne 0 ]; then
+                had_failure=1
+              fi
+            done
+          done
+          printf '\nAll six fixed attempts ran; any nonzero exit keeps this job failed. Per-attempt counts/skips remain in logs.\n' >> "$GITHUB_STEP_SUMMARY"
+          exit "$had_failure"
+
+      - name: Confirm head remains unchanged
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          TEST_OUTCOME: ${{ steps.focused_tests.outcome }}
+        run: |
+          printf '\nHEAD focused batch outcome=%s; this is not a full root head pass.\n' "$TEST_OUTCOME" >> "$GITHUB_STEP_SUMMARY"
+          test "$(git rev-parse HEAD)" = '88fd3eed2f513ca4c140df73f00c624075ff91dd'
+          test -z "$(git status --porcelain)"
+
