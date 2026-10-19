@@ -5,6 +5,9 @@ in Docker. The host needs Node.js only for the small `spaceapp` launcher,
 and enough resources for the stack. The launcher installs and starts Docker
 automatically when it is missing.
 
+Rootless Podman is an alternative on Linux and macOS. Docker remains the
+default; the selected engine is saved for every later command.
+
 ## Requirements
 
 Minimum (the `small` profile):
@@ -20,6 +23,59 @@ The `large` profile, which adds managed browser sessions, requires:
 - 8 CPU cores;
 - 15 GiB RAM;
 - 11 GiB free disk.
+
+### Podman prerequisites and limits
+
+Install Podman 5+ and the standalone `docker-compose` v2 provider >=2.24.4
+before using `install --engine podman`. Python `podman-compose` is unsupported;
+the launcher pins the external provider for every Compose invocation.
+
+On Linux, use a normal user with subordinate UID/GID ranges, cgroup v2 and
+delegated CPU/memory controllers. Start its API socket in a systemd user
+session with `systemctl --user enable --now podman.socket`. The launcher checks
+reported delegation and tests real CPU/memory limits before installation or
+update cutover; a missing controller stops the operation with instructions.
+
+On macOS, initialize/start a rootless Podman machine. Intel Macs require
+Podman 5.8 (Podman 6 removed Intel support). Select its default connection with
+`podman system connection default <connection>`; unset `CONTAINER_HOST` and
+`CONTAINER_CONNECTION`. Both the host and the selected engine must meet the
+profile requirements. Actual engine CPU/RAM and available storage are checked,
+and a failure prints `podman machine stop`, `set --cpus/--memory/--disk-size`,
+and `start` guidance. Allocate extra VM headroom; a configured disk size alone
+does not establish free space, and resizing support depends on the VM provider.
+
+```bash
+npx --yes run-spaceapp@latest install --engine podman --profile small
+npx --yes run-spaceapp@latest doctor
+npx --yes run-spaceapp@latest backup
+```
+
+For a fresh unattended installation, add `--non-interactive --no-open`, or pass
+`--answers '{"engine":"podman","profile":"small","confirm":true,"open":false}'`.
+Fresh Podman unattended setup approves its displayed plan; explicit
+`"confirm":false` cancels. Existing-install changes and destructive operations
+still require their confirmations. If Docker is absent and Podman is installed,
+a fresh install offers Podman (selects it in non-interactive mode).
+
+SELinux enforcing workspaces use shared `z` labels. Add project directories you
+own with `workspace add <path>` or `workspace add <path> --read-only`; shared
+labels let core and CLI access them without changing their host owner. App
+entrypoints still start as root inside the user namespace, then drop to UID
+10001 mapped to your host account. Read-only mounts remain read-only. Avoid
+system directories because relabeling traverses the folder. File secrets are
+mounted individually read-only with the same labels, at their original targets.
+Cold image UID mapping preparation can take up to ten minutes. The subsequent
+CPU/memory limits check has a separate thirty-second execution deadline; both
+must succeed before application cutover. A preparation timeout leaves those
+limits unverified and preserves the engine selection for recovery.
+
+`doctor` and `support-bundle` report engine/provider versions, rootless status,
+cgroup version and limit delegation without copying full engine information or
+secrets. Every lifecycle command uses the saved engine. Engine switching is
+refused before modifying an existing installation: Docker and Podman volumes
+are separate, and in-place migration is unsupported. Podman `--access host-root`
+and Windows Podman are unsupported. See the [launcher reference](../packages/run-spaceapp/README.md#rootless-podman-linux-and-macos).
 
 ## Linux
 

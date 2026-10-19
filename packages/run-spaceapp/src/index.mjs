@@ -1,7 +1,10 @@
 import { createHash, randomBytes } from "node:crypto";
 import {
   chmod,
+  link,
+  lstat,
   mkdir,
+  open,
   readFile,
   readdir,
   rename,
@@ -18,6 +21,7 @@ import {
   stripTrailingLineEndings
 } from "./string-utils.mjs";
 import { UNIVERSAL_COMMAND } from "./package-info.mjs";
+import { assertEngineAccess, assertEngineSelection, containerEngine, engineCommand } from "./engines.mjs";
 
 const CONFIG_SCHEMA_VERSION = 4;
 const CONTAINER_SECRET_MODE = 0o644;
@@ -113,6 +117,7 @@ const CONFIG_KEYS = new Set([
   "port",
   "telemetry",
   "profile",
+  "engine",
   "accessMode",
   "workspaces",
   "companionsEnabled",
@@ -269,7 +274,9 @@ export function installResourceChecks(resources, profile = "small", { requiredDi
   const requirements = PROFILE_REQUIREMENTS[profile];
   if (!requirements) throw new Error("Unknown installation profile.");
   const minFreeDisk = requiredDiskBytes ?? (operation === "fresh" ? requirements.freshDiskBytes : 512 * 1024 ** 2);
-  const engineMemoryBytes = { small: 3, medium: 5, large: 7, light: 3, standard: 3 }[profile] * 1024 ** 3;
+  const podman = resources.engine === "podman";
+  const engineName = podman ? "Podman" : "Docker";
+  const engineMemoryBytes = podman ? requirements.memoryBytes : { small: 3, medium: 5, large: 7, light: 3, standard: 3 }[profile] * 1024 ** 3;
   return [
     {
       name: "CPU",
@@ -286,16 +293,17 @@ export function installResourceChecks(resources, profile = "small", { requiredDi
       ok: freeDiskBytes >= minFreeDisk,
       detail: `${formatGibibytes(freeDiskBytes)} GiB available; ${formatGibibytes(minFreeDisk)} GiB required${operation === "fresh" ? "" : " additionally for " + operation}`
     },
-    ...(resources.engineMemoryBytes > 0 ? [{ name: "Docker memory", ok: resources.engineMemoryBytes >= engineMemoryBytes,
+    ...(resources.engineMemoryBytes > 0 ? [{ name: `${engineName} memory`, ok: resources.engineMemoryBytes >= engineMemoryBytes,
       detail: `${formatGibibytes(resources.engineMemoryBytes)} GiB allocated; ${formatGibibytes(engineMemoryBytes)} GiB required for ${profile}` }] : []),
-    ...(resources.engineCpuCount > 0 ? [{ name: "Docker CPU", ok: resources.engineCpuCount >= 4,
-      detail: `${resources.engineCpuCount} allocated; 4 required` }] : [])
+    ...(resources.engineCpuCount > 0 ? [{ name: `${engineName} CPU`, ok: resources.engineCpuCount >= (podman ? requirements.cpuCount : 4),
+      detail: `${resources.engineCpuCount} allocated; ${podman ? requirements.cpuCount : 4} required` }] : [])
   ];
 }
 
 export function createDefaultConfig({
   version,
   profile = "light",
+  engine,
   accessMode = "isolated",
   companionsEnabled = false
 }) {
@@ -304,6 +312,7 @@ export function createDefaultConfig({
     throw new Error("Default config requires a resolved installation profile.");
   }
   const resolvedAccessMode = resolveInstallAccessMode(accessMode);
+  assertEngineAccess({ engine, accessMode: resolvedAccessMode });
   return {
     schemaVersion: CONFIG_SCHEMA_VERSION,
     version,
@@ -312,6 +321,7 @@ export function createDefaultConfig({
     port: 4911,
     telemetry: false,
     profile,
+    ...(engine === undefined ? {} : { engine: containerEngine(engine) }),
     accessMode: resolvedAccessMode,
     companionsEnabled,
     optionalModules: "none",
@@ -353,6 +363,8 @@ export function validateConfig(config) {
   if (config.accessMode !== "isolated" && config.accessMode !== "host-root") {
     throw new Error("accessMode must be isolated or host-root.");
   }
+  containerEngine(config);
+  assertEngineAccess(config);
   if (typeof config.companionsEnabled !== "boolean") {
     throw new Error("companionsEnabled must be boolean.");
   }
@@ -417,8 +429,74 @@ function userOf(config, userId) {
 export async function saveConfig(root, config) {
   validateHome(root);
   validateConfig(config);
+  const existing = await readFile(join(root, "config.json"), "utf8").then(JSON.parse).catch((error) => {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  });
+  await resolveInstallationEngine(root, containerEngine(config), existing);
   await mkdir(root, { recursive: true, mode: 0o700 });
   await atomicWrite(join(root, "config.json"), `${JSON.stringify(config, null, 2)}\n`);
+  await clearPendingEngine(root, containerEngine(config));
+}
+
+const PENDING_ENGINE_FILE = "install-engine.json";
+
+export async function loadPendingEngine(root) {
+  validateHome(root);
+  const path = join(root, PENDING_ENGINE_FILE);
+  const metadata = await lstat(path).catch((error) => {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  });
+  if (metadata === null) return null;
+  const invalid = () => new Error("Invalid pending installation engine marker. Preserve install-engine.json and existing volumes; resolve the recovery state before installing again.");
+  if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size > 256) throw invalid();
+  const handle = await open(path, "r");
+  try {
+    const current = await handle.stat();
+    if (!current.isFile() || current.size > 256 || current.ino !== metadata.ino || current.dev !== metadata.dev) throw invalid();
+    const buffer = Buffer.alloc(257);
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+    if (bytesRead > 256) throw invalid();
+    let record;
+    try { record = JSON.parse(buffer.subarray(0, bytesRead).toString("utf8")); } catch { throw invalid(); }
+    if (!record || Array.isArray(record) || Object.keys(record).length !== 2 || record.schemaVersion !== 1 ||
+      record.engine !== "docker" && record.engine !== "podman") throw invalid();
+    return record.engine;
+  } finally { await handle.close(); }
+}
+
+export async function resolveInstallationEngine(root, requested, existing) {
+  const pending = await loadPendingEngine(root);
+  if (pending !== null && existing) assertEngineSelection(containerEngine(existing), { engine: pending });
+  return { engine: assertEngineSelection(requested, existing ?? (pending === null ? null : { engine: pending })), pending };
+}
+
+export async function claimInstallEngine(root, config) {
+  validateHome(root);
+  const engine = containerEngine(config);
+  await resolveInstallationEngine(root, engine, await loadConfig(root).catch((error) => {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  }));
+  const temporary = join(root, `.install-engine-${randomBytes(8).toString("hex")}.tmp`);
+  try {
+    await writeFile(temporary, `${JSON.stringify({ schemaVersion: 1, engine })}\n`, { flag: "wx", mode: 0o600 });
+    // A hard-link publishes the complete file atomically and never overwrites
+    // another install's choice. A partial file or competing engine fails closed.
+    await link(temporary, join(root, PENDING_ENGINE_FILE)).catch((error) => {
+      if (error?.code !== "EEXIST") throw error;
+    });
+    assertEngineSelection(engine, { engine: await loadPendingEngine(root) });
+  } finally { await rm(temporary, { force: true }); }
+}
+
+async function clearPendingEngine(root, engine) {
+  const pending = await loadPendingEngine(root);
+  if (pending === null) return;
+  assertEngineSelection(engine, { engine: pending });
+  assertEngineSelection(engine, await loadConfig(root));
+  await rm(join(root, PENDING_ENGINE_FILE), { force: true });
 }
 
 export async function loadConfig(root) {
@@ -665,7 +743,8 @@ export function renderWorkspaceCompose(config, { cliSandbox = false } = {}) {
     "      - type: bind",
     `        source: ${JSON.stringify(workspace.hostPath)}`,
     `        target: ${JSON.stringify(workspace.containerPath)}`,
-    `        read_only: ${workspace.readOnly}`
+    `        read_only: ${workspace.readOnly}`,
+    ...(containerEngine(config) === "podman" ? ["        bind:", "          selinux: z"] : [])
   ]);
   const service = mounts.length > 0
     ? ["    volumes:", ...mounts]
@@ -680,7 +759,8 @@ export function renderWorkspaceCompose(config, { cliSandbox = false } = {}) {
     "      - type: bind",
     `        source: ${JSON.stringify(workspace.hostPath)}`,
     `        target: ${JSON.stringify(workspace.containerPath)}`,
-    `        read_only: ${workspace.readOnly}`
+    `        read_only: ${workspace.readOnly}`,
+    ...(containerEngine(config) === "podman" ? ["        bind:", "          selinux: z"] : [])
   ];
   const userServices = users.flatMap((user) => {
     const slug = userSlug(user.id);
@@ -689,6 +769,7 @@ export function renderWorkspaceCompose(config, { cliSandbox = false } = {}) {
       "    image: ghcr.io/oll4com/spaceapp-cli:${SPACEAPP_IMAGE_TAG}",
       "    restart: unless-stopped",
       "    init: true",
+      ...(containerEngine(config) === "podman" ? ["    user: \"0:0\"", "    userns_mode: keep-id:uid=10001,gid=10001"] : []),
       "    security_opt:",
       "      - no-new-privileges:true",
       ...(cliSandbox ? CLI_SANDBOX_OPTIONS.slice(1) : []),
@@ -699,11 +780,11 @@ export function renderWorkspaceCompose(config, { cliSandbox = false } = {}) {
       "      SPACE_MEMORY_ROOT: /var/lib/spaceapp/memory",
       "      SPACE_CLI_HOST_SOCKET: /run/spaceapp-cli/host.sock",
       "    volumes:",
-      `      - spaceapp-cli-state-${slug}:/var/lib/spaceapp-cli`,
-      `      - spaceapp-memory-${slug}:/var/lib/spaceapp/memory`,
-      `      - spaceapp-cli-socket-${slug}:/run/spaceapp-cli`,
-      `      - spaceapp-workspaces-${slug}:/workspaces`,
-      `      - ./secrets/users/${slug}/providers:/run/spaceapp-secrets/providers:ro`,
+      `      - spaceapp-cli-state-${slug}:/var/lib/spaceapp-cli${containerEngine(config) === "podman" ? ":z" : ""}`,
+      `      - spaceapp-memory-${slug}:/var/lib/spaceapp/memory${containerEngine(config) === "podman" ? ":z" : ""}`,
+      `      - spaceapp-cli-socket-${slug}:/run/spaceapp-cli${containerEngine(config) === "podman" ? ":z" : ""}`,
+      `      - spaceapp-workspaces-${slug}:/workspaces${containerEngine(config) === "podman" ? ":z" : ""}`,
+      `      - ./secrets/users/${slug}/providers:/run/spaceapp-secrets/providers:${containerEngine(config) === "podman" ? "ro,z" : "ro"}`,
       ...user.workspaces.flatMap(bind),
       // Its own network: internet only, never the owner's internal services (temporal, companions) or other users.
       "    networks:",
@@ -718,8 +799,8 @@ export function renderWorkspaceCompose(config, { cliSandbox = false } = {}) {
     "      SPACE_CLI_HOST_SOCKETS_FILE: /etc/spaceapp/cli-hosts.json",
     "    volumes:",
     ...(mounts.length > 0 ? mounts : []),
-    "      - ./cli-hosts.json:/etc/spaceapp/cli-hosts.json:ro",
-    ...users.map((user) => `      - spaceapp-cli-socket-${userSlug(user.id)}:/run/spaceapp-cli-users/${userSlug(user.id)}`),
+    `      - ./cli-hosts.json:/etc/spaceapp/cli-hosts.json:${containerEngine(config) === "podman" ? "ro,z" : "ro"}`,
+    ...users.map((user) => `      - spaceapp-cli-socket-${userSlug(user.id)}:/run/spaceapp-cli-users/${userSlug(user.id)}${containerEngine(config) === "podman" ? ":z" : ""}`),
     "  spaceapp-cli:",
     ...service,
     ...(cliSandbox ? CLI_SANDBOX_OPTIONS : []),
@@ -782,6 +863,7 @@ export function composeCommand(action, root, options = {}) {
     "-f", join(stateRoot, "compose.yml"),
     "-f", join(stateRoot, "compose.workspaces.yml"),
     "-f", join(stateRoot, "compose.host-access.yml"),
+    ...(containerEngine(options) === "podman" ? ["-f", join(stateRoot, "compose.podman.yml")] : []),
     ...(settings.browserEnabled ? ["--profile", "standard"] : []),
     ...(settings.temporalEnabled ? ["--profile", "workflows"] : []),
     ...(options.companionsEnabled ? ["--profile", "companions"] : [])
@@ -886,7 +968,7 @@ export function composeCommand(action, root, options = {}) {
   if (!selected) {
     throw new Error(`Unsupported Compose action "${action}".`);
   }
-  return { command: "docker", args: [...base, ...selected] };
+  return engineCommand(options, [...base, ...selected]);
 }
 
 export function composeProjectName(root) {
@@ -920,15 +1002,43 @@ export async function writeRuntimeFiles(root, config) {
   await atomicWrite(join(root, "cli-hosts.json"), renderCliHosts(config), 0o644);
   for (const user of config.users ?? []) await mkdir(providerSecretsRoot(root, user.id), { recursive: true, mode: 0o700 });
   await atomicWrite(join(root, "compose.host-access.yml"), renderHostAccessCompose(config));
+  if (containerEngine(config) === "podman") await atomicWrite(join(root, "compose.podman.yml"), renderPodmanCompose());
+}
+
+// Preserve the published images' root entrypoints, then their UID 10001 maps to the
+// invoking host user. Shared volumes and shared SELinux labels also serve the sockets.
+export function renderPodmanCompose() {
+  const services = {
+    "spaceapp-core": { volumes: ["spaceapp-data:/var/lib/spaceapp:z", "spaceapp-memory:/var/lib/spaceapp/memory:z", "spaceapp-cli-socket:/run/spaceapp-cli:z", "spaceapp-browser-socket:/run/spaceapp-browser:z", "spaceapp-workspaces:/workspaces:z", "./backups:/backups:z"], secrets: ["setup-token", "session-secret", "database-url"] },
+    "spaceapp-cli": { volumes: ["spaceapp-cli-state:/var/lib/spaceapp-cli:z", "spaceapp-memory:/var/lib/spaceapp/memory:z", "spaceapp-cli-socket:/run/spaceapp-cli:z", "spaceapp-workspaces:/workspaces:z", "./secrets/providers:/run/spaceapp-secrets/providers:ro,z"], secrets: [] },
+    "spaceapp-browser": { volumes: ["spaceapp-data:/var/lib/spaceapp:z", "spaceapp-browser-socket:/run/spaceapp-browser:z"], secrets: ["database-url"] },
+    postgres: { volumes: [], secrets: ["postgres-password"] },
+    temporal: { volumes: [], secrets: ["postgres-password"] }
+  };
+  return ["services:", ...Object.entries(services).flatMap(([service, { volumes, secrets }]) => [
+    `  ${service}:`,
+    ...(service.startsWith("spaceapp-") ? ["    user: \"0:0\"", "    userns_mode: keep-id:uid=10001,gid=10001"] : []),
+    // docker-compose implements file secrets as read-only binds. Its secret syntax
+    // has no SELinux option; use equivalent per-file shared labels in Podman only.
+    ...(secrets.length ? ["    secrets: !reset []"] : []),
+    ...((volumes.length || secrets.length) ? ["    volumes:", ...[...volumes, ...secrets.map((name) => `./secrets/${name}:/run/secrets/${name}:ro,z`)].map((mount) => `      - ${mount}`)] : [])
+  ]), ""].join("\n");
 }
 
 export async function prepareInstallation(root, {
   version,
   profile,
+  engine,
   accessMode,
   companionsEnabled
 }) {
   validateHome(root);
+  const existing = await loadConfig(root).catch((error) => {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  });
+  const selection = await resolveInstallationEngine(root, engine, existing);
+  assertEngineAccess({ engine: selection.engine, accessMode: accessMode ?? existing?.accessMode });
   await mkdir(root, { recursive: true, mode: 0o700 });
   await Promise.all([
     mkdir(join(root, "backups"), { recursive: true, mode: 0o700 }),
@@ -947,6 +1057,7 @@ export async function prepareInstallation(root, {
     config = createDefaultConfig({
       version,
       profile: resolvedProfile ?? "light",
+      engine: engine ?? (selection.engine === "podman" ? "podman" : undefined),
       accessMode: resolveInstallAccessMode(accessMode),
       companionsEnabled
     });
@@ -958,6 +1069,7 @@ export async function prepareInstallation(root, {
       previousVersion: config.version
     };
   }
+  if (engine !== undefined && config.engine !== engine) config = { ...config, engine };
   if (resolvedProfile !== undefined) {
     config = { ...config, profile: resolvedProfile };
   }
@@ -1032,6 +1144,11 @@ export async function commitInstallation(root, config, {
 } = {}) {
   validateHome(root);
   validateConfig(config);
+  const existing = await readFile(join(root, "config.json"), "utf8").then(JSON.parse).catch((error) => {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  });
+  await resolveInstallationEngine(root, containerEngine(config), existing);
   const composeTemplate = await readFile(join(templateDir, "compose.yml"), "utf8");
   await mkdir(root, { recursive: true, mode: 0o700 });
   await atomicWrite(join(root, "compose.yml"), composeTemplate);

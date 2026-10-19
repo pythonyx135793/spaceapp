@@ -1,6 +1,6 @@
 # run-spaceapp
 
-Cross-platform Docker launcher for SpaceApp.
+Docker and rootless Podman launcher for SpaceApp.
 
 Run the same command in Linux, macOS, or Windows 11 Command Prompt:
 
@@ -61,6 +61,100 @@ a conservative estimate is shown. Space is checked again after pulling and
 before pausing writers. Existing data is kept in place; the launcher never deletes
 images, backups or volumes to free space. Separate Docker disk capacity is checked
 when measurable and its availability is reported.
+
+### Rootless Podman (Linux and macOS)
+
+Docker remains the default. Select Podman on a new installation:
+
+```bash
+npx --yes run-spaceapp@latest install --engine podman --profile small
+# Fresh unattended install (does not enable telemetry or open a browser):
+npx --yes run-spaceapp@latest install --engine podman --profile small --non-interactive --no-open
+```
+
+Install **Podman 5+** and the standalone **docker-compose v2 >= 2.24.4**
+provider first. The launcher does not install Podman. The executable must be
+named `docker-compose` on `PATH`; a `docker compose` plugin alone is insufficient.
+Every Podman Compose command pins `PODMAN_COMPOSE_PROVIDER=docker-compose`,
+including diagnostics and recovery. Python `podman-compose` is unsupported.
+Docker host/context/TLS overrides are removed only from the Podman Compose
+child's environment so its wrapper selects the Podman socket; the parent
+environment and Podman connection settings are preserved.
+This provider supplies profiles, optional health dependencies, `init`, resource
+limits, file secrets, shared socket volumes, `--wait`, and UID-specific
+`exec`/`run`. The Podman override keeps each file secret at its original
+read-only target with a shared SELinux label; it never mounts the whole secret
+directory. Docker's template and commands remain unchanged.
+
+On Linux, run as a regular user with subordinate UID/GID ranges, **cgroup v2**,
+and CPU and memory controllers delegated to the systemd user session. Start
+the rootless API socket before installation:
+
+```bash
+systemctl --user enable --now podman.socket
+podman info
+```
+
+The launcher checks both reported delegation and actual kernel CPU/memory
+limits in a bounded container before installation/update cutover. Preparing a
+cold image's UID mapping has a separate ten-minute deadline; the actual kernel
+check then has a thirty-second execution deadline. Preparation does not count
+as a successful limits check. `doctor`
+and `support-bundle` report engine/provider versions, rootless status, cgroups,
+delegation, and available engine resources. Failed checks explain the missing
+prerequisite. No resource guard is disabled for Podman.
+
+On macOS, initialize and start a rootless Podman machine first. Intel Macs
+require **Podman 5.8**; Podman 6 removed Intel support. Select the machine's
+default connection with `podman system connection default <connection>`.
+The launcher matches that connection to its running machine, checks the
+daemon's actual CPU/RAM and available storage, and prints stop/set/start resize
+instructions on failure. A different default machine's configuration or the
+Mac's host resources cannot satisfy the guest checks. Environment overrides
+`CONTAINER_HOST`/`CONTAINER_CONNECTION` cannot be matched safely here: unset
+them and choose the default connection instead. Machine providers differ in
+which resources they can resize; preserve volumes before recreating a machine.
+Allocate at least the profile's resources in the table above plus VM headroom.
+
+`workspace add <path>` and `workspace add <path> --read-only` use shared SELinux
+labels (`z`) so both application services can access the same project on an
+enforcing host. Register project folders you own, not system directories: a
+relabel traverses their contents. The published images still start their root
+entrypoints and drop to UID 10001; `keep-id:uid=10001,gid=10001` maps that user
+to the invoking host user. The launcher does not recursively change workspace
+ownership or grant world write access. Read-only mounts stay read-only.
+
+The engine is saved and used by every subsequent command, including backup,
+restore, owner/credentials/provider commands, repair, rollback and purge. A
+configuration without an engine remains Docker. Changing an existing
+installation's engine is refused before mutation because the engines cannot
+see each other's volumes; no in-place migration is supported. Podman does not
+support `--access host-root` or Windows. If Docker is absent and Podman is
+installed, a new interactive installation offers Podman; `--non-interactive`
+selects it. `--answers` also accepts `"engine":"podman"`. Fresh unattended
+Podman setup approves the displayed plan; set `"confirm":false` to cancel.
+Existing-install changes and destructive commands retain their confirmations.
+
+A first runtime start records a small `install-engine.json` recovery marker
+before creating engine resources. If startup fails, retries retain that engine
+even while `config.json` is not committed. A successful config commit removes
+the marker, leaving the config as the final source of truth. Malformed or
+conflicting markers stop setup rather than being overwritten. Preserve them
+and existing volumes when investigating a failed install. Timed-out probes
+return exit 124; a bounded return does not prove a stuck engine child or its
+I/O ended. The launcher checks removal of its exact named probe and reports
+unconfirmed cleanup explicitly; it never prunes unrelated containers or data.
+
+The rootless integration job runs on `ubuntu-latest`, builds pinned Podman and
+network helpers from official sources, and uses pinned upstream Compose and
+OCI runtime releases. It verifies rootless mappings, cgroup delegation and
+actual CPU, memory and storage capacity before an actual small install,
+`/readyz` check, nonempty backup with matching hashes and exact owned-resource
+purge. The job fails when a prerequisite or cleanup check cannot be verified.
+
+Primary references: [Podman compose provider](https://docs.podman.io/en/v5.8.3/markdown/podman-compose.1.html),
+[Podman user namespaces and volume labels](https://docs.podman.io/en/v5.8.3/markdown/podman-run.1.html),
+[Compose merge/reset rules](https://docs.docker.com/reference/compose-file/merge/).
 
 ### Telemetry
 
