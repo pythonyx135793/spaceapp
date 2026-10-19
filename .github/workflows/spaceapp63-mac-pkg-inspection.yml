@@ -1,0 +1,514 @@
+name: Issue 63 Intel Mac published package inspection only
+
+on:
+  push:
+    branches:
+      - codex/spaceapp63-mac-pkg-inspect-cp395-r85
+    paths:
+      - .github/workflows/spaceapp63-mac-pkg-inspection.yml
+
+permissions:
+  contents: read
+
+jobs:
+  published_package_inspection:
+    runs-on: macos-15-intel
+    timeout-minutes: 15
+    steps:
+      - name: Guard the one public fork and exact branch
+        id: repository_guard
+        env:
+          EXPECTED_REPOSITORY: pythonyx135793/spaceapp
+          ACTUAL_REPOSITORY: ${{ github.repository }}
+          EVENT_REPOSITORY: ${{ github.event.repository.full_name }}
+          EVENT_FORK: ${{ github.event.repository.fork }}
+          EVENT_PRIVATE: ${{ github.event.repository.private }}
+          EVENT_NAME: ${{ github.event_name }}
+          EXPECTED_REF: refs/heads/codex/spaceapp63-mac-pkg-inspect-cp395-r85
+          ACTUAL_REF: ${{ github.ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$ACTUAL_REPOSITORY" = "$EXPECTED_REPOSITORY"
+          test "$EVENT_REPOSITORY" = "$EXPECTED_REPOSITORY"
+          test "$EVENT_FORK" = "true"
+          test "$EVENT_PRIVATE" = "false"
+          test "$EVENT_NAME" = "push"
+          test "$ACTUAL_REF" = "$EXPECTED_REF"
+
+      - name: Inspect one pinned public package without installation or execution
+        id: package_metadata
+        timeout-minutes: 12
+        env:
+          ACTUAL_REPOSITORY: ${{ github.repository }}
+          ACTUAL_REF: ${{ github.ref }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          RUNNER_TEMP_PATH: ${{ runner.temp }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          node <<'NODE_PACKAGE_INSPECTION'
+          'use strict';
+          
+          // Preparation only: locally syntax-check this file; the reviewed workflow embeds it.
+          // No extracted binary, installer script, daemon, package installer or VM is executed.
+          const fs = require('node:fs');
+          const fsp = require('node:fs/promises');
+          const path = require('node:path');
+          const os = require('node:os');
+          const crypto = require('node:crypto');
+          const https = require('node:https');
+          const { spawn } = require('node:child_process');
+          
+          const PIN = Object.freeze({
+            url: 'https://github.com/podman-container-tools/podman/releases/download/v5.8.1/podman-installer-macos-amd64.pkg',
+            bytes: 61558815,
+            sha256: '8cd9338a4190c72b90b5e73e00261475bd5a4c3d3f1d979401238bada97b86a5',
+            version: '5.8.1',
+            identifier: 'com.redhat.podman'
+          });
+          const sourceProvenanceOnly = '562203048cf075fe36e47f87f9368034f7f73507';
+          const maxCommandBytes = 64 * 1024;
+          const maxEntries = 3000;
+          const maxExpandedBytes = 2 * 1024 ** 3;
+          const maxPublicBytes = 4 * 1024 ** 2;
+          const stockTools = new Set(['/usr/bin/sw_vers', '/usr/sbin/pkgutil', '/usr/sbin/spctl', '/usr/bin/xar',
+            '/bin/df', '/usr/bin/xmllint', '/usr/bin/codesign', '/usr/bin/lipo']);
+          const started = Date.now();
+          const deadline = started + 11 * 60 * 1000;
+          let root, stage, out, reportPath, report;
+          let currentChild = null;
+          let currentChildRecord = null;
+          
+          class InspectionStop extends Error {
+            constructor(message) { super(message); this.name = 'InspectionStop'; }
+          }
+          function gate(value, message) { if (!value) throw new InspectionStop(message); }
+          function inside(parent, child) {
+            const relative = path.relative(parent, child);
+            return relative === '' || (!relative.startsWith('..' + path.sep) && relative !== '..' && !path.isAbsolute(relative));
+          }
+          function budget(milliseconds = 0) { gate(Date.now() + milliseconds < deadline, 'Original eleven-minute inspection budget exhausted'); }
+          function type(st) {
+            return st.isDirectory() ? 'directory' : st.isFile() ? 'regular' : st.isSymbolicLink() ? 'symlink' : 'other';
+          }
+          function metadata(p) {
+            try {
+              const st = fs.lstatSync(p);
+              return { exists: true, type: type(st), uid: st.uid, gid: st.gid, mode: st.mode & 0o7777, size: st.size, nlink: st.nlink, dev: st.dev, ino: st.ino,
+                link: st.isSymbolicLink() ? fs.readlinkSync(p) : null };
+            } catch (e) {
+              if (e.code === 'ENOENT') return { exists: false };
+              return { exists: null, error_code: e.code || 'UNKNOWN' };
+            }
+          }
+          function publicSize() {
+            let bytes = 0;
+            for (const entry of fs.readdirSync(out, { withFileTypes: true })) {
+              gate(entry.isFile() && !entry.isSymbolicLink(), 'Public export contains a nonregular member');
+              bytes += fs.lstatSync(path.join(out, entry.name)).size;
+            }
+            return bytes;
+          }
+          function writePublic(name, contents, replace = false) {
+            gate(/^[a-z0-9-]+\.(?:json|txt)$/.test(name), 'Public export name is not allowlisted text');
+            const data = Buffer.from(contents, 'utf8');
+            gate(data.length <= 2 * 1024 ** 2, 'Public text member exceeds its bound');
+            const dest = path.join(out, name);
+            const old = replace && fs.existsSync(dest) ? fs.lstatSync(dest).size : 0;
+            gate(publicSize() - old + data.length <= maxPublicBytes, 'Public metadata export exceeds four MiB');
+            if (replace) {
+              const tmp = path.join(out, 'report-writing.json');
+              fs.writeFileSync(tmp, data, { mode: 0o600, flag: 'wx' });
+              fs.renameSync(tmp, dest);
+            } else fs.writeFileSync(dest, data, { mode: 0o600, flag: 'wx' });
+          }
+          function save() {
+            if (!out || !report) return;
+            report.updated_at_utc = new Date().toISOString();
+            report.elapsed_seconds = (Date.now() - started) / 1000;
+            writePublic('report.json', JSON.stringify(report, null, 2) + '\n', true);
+          }
+          function childEnv() {
+            // No token/env dump and no modified trust, helper, socket, XDG or security setting.
+            return { PATH: '/usr/bin:/bin:/usr/sbin:/sbin', HOME: os.homedir(), LANG: 'C', LC_ALL: 'C', TMPDIR: path.join(stage, 'tmp') };
+          }
+          async function command(executable, args, timeoutMs, label, requireZero = true) {
+            gate(timeoutMs >= 3000 && timeoutMs <= 30000, 'Metadata/signature command timeout outside3-30seconds');
+            gate(stockTools.has(executable), 'Executable is not a fixed stock metadata tool');
+            gate(!inside(stage, executable), 'Attempt to execute staged package content');
+            budget(timeoutMs);
+            const began = Date.now();
+            const item = { label, executable, args, timeout_ms: timeoutMs, started_at_utc: new Date().toISOString(),
+              exit_code: null, signal: null, timeout: false, output_limit: false, close_observed: false,
+              stdout: '', stderr: '' };
+            report.commands.push(item);
+            save();
+            await new Promise((resolve) => {
+              const postKillWindowMs = 500;
+              item.original_total_bound_ms = timeoutMs;
+              item.execution_timeout_ms = timeoutMs - postKillWindowMs;
+              item.post_kill_observation_cap_ms = postKillWindowMs;
+              let done = false, timer, postKillTimer, stopRequested = false;
+              let stdout = Buffer.alloc(0), stderr = Buffer.alloc(0);
+              const child = spawn(executable, args, { cwd: stage, env: childEnv(), detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+              currentChild = child;
+              currentChildRecord = item;
+              const finish = () => {
+                if (done) return;
+                done = true;
+                clearTimeout(timer); clearTimeout(postKillTimer);
+                item.stdout = stdout.toString('utf8'); item.stderr = stderr.toString('utf8');
+                item.seconds = (Date.now() - began) / 1000;
+                item.pid = Number.isInteger(child.pid) ? child.pid : null;
+                item.cleanup_confirmed = item.close_observed || item.spawn_failed_no_pid === true;
+                item.cleanup_observation = item.cleanup_confirmed ? (item.close_observed ? 'OBSERVED_CLOSE' : 'NO_CHILD_PID_CREATED') : 'UNCONFIRMED_AFTER_BOUNDED_POST_KILL_WINDOW';
+                child.stdout?.destroy(); child.stderr?.destroy();
+                if (item.cleanup_confirmed && currentChild === child) { currentChild = null; currentChildRecord = null; }
+                else if (!item.cleanup_confirmed) child.unref(); // retain exact handle/record; do not await indefinitely
+                resolve();
+              };
+              const killOwned = () => {
+                if (Number.isInteger(child.pid)) {
+                  try { process.kill(-child.pid, 'SIGKILL'); item.owned_group_kill_requested = true; }
+                  catch (e) { item.kill_error_code = e.code || 'UNKNOWN'; }
+                }
+              };
+              const stopAndObserve = () => {
+                if (done || stopRequested) return;
+                stopRequested = true;
+                clearTimeout(timer);
+                item.kill_requested_at_utc = new Date().toISOString();
+                killOwned();
+                const observationMs = Math.min(postKillWindowMs, Math.max(0, began + timeoutMs - Date.now()));
+                item.post_kill_observation_budget_ms = observationMs;
+                postKillTimer = setTimeout(() => { item.post_kill_window_expired = true; finish(); }, observationMs);
+              };
+              const data = (which, chunk) => {
+                if (done || stopRequested) return;
+                const previous = which === 'stdout' ? stdout : stderr;
+                if (previous.length + chunk.length > maxCommandBytes) {
+                  item.output_limit = true; stopAndObserve(); return;
+                }
+                if (which === 'stdout') stdout = Buffer.concat([stdout, chunk]);
+                else stderr = Buffer.concat([stderr, chunk]);
+              };
+              child.stdout.on('data', chunk => data('stdout', chunk));
+              child.stderr.on('data', chunk => data('stderr', chunk));
+              child.on('error', e => {
+                item.error_code = e.code || 'UNKNOWN';
+                if (!Number.isInteger(child.pid)) { item.spawn_failed_no_pid = true; finish(); }
+                else stopAndObserve();
+              });
+              child.on('exit', (code, signal) => { item.exit_observed = true; item.observed_exit_code = code; item.observed_exit_signal = signal; });
+              child.on('close', (code, signal) => {
+                if (done) {
+                  // Keep the original bounded result conservative; late close does not turn it into a pass.
+                  if (currentChild === child) { currentChild = null; currentChildRecord = null; }
+                  return;
+                }
+                item.exit_code = code; item.signal = signal; item.close_observed = true; finish();
+              });
+              timer = setTimeout(() => { item.timeout = true; stopAndObserve(); }, Math.max(0, timeoutMs - postKillWindowMs - (Date.now() - began)));
+            });
+            save();
+            gate(item.cleanup_confirmed, label + ': exact owned command cleanup remains unconfirmed');
+            if (requireZero) gate(!item.timeout && !item.output_limit && !item.error_code && item.close_observed && item.exit_code === 0, label + ': original incomplete/nonzero command result retained');
+            return item;
+          }
+          async function hashFile(file, timeoutMs = 15000) {
+            budget(timeoutMs);
+            return await new Promise((resolve, reject) => {
+              const h = crypto.createHash('sha256');
+              const stream = fs.createReadStream(file, { highWaterMark: 256 * 1024 });
+              const timer = setTimeout(() => { stream.destroy(); reject(new InspectionStop('Bounded owned-file hash timed out')); }, timeoutMs);
+              stream.on('data', chunk => h.update(chunk));
+              stream.on('error', e => { clearTimeout(timer); reject(e); });
+              stream.on('end', () => { clearTimeout(timer); resolve(h.digest('hex')); });
+            });
+          }
+          async function downloadOne() {
+            budget(120000);
+            const destination = path.join(stage, 'podman-installer-macos-amd64.pkg');
+            gate(!fs.existsSync(destination), 'Package download destination already exists');
+            const fd = fs.openSync(destination, 'wx', 0o600);
+            const record = { initial_url: PIN.url, expected_bytes: PIN.bytes, expected_sha256: PIN.sha256,
+              attempts: 1, redirects: [], downloaded_bytes: 0, completed: false };
+            report.download = record; save();
+            let activeRequest, activeResponse;
+            try {
+              await new Promise((resolve, reject) => {
+                let done = false;
+                const finish = (error) => {
+                  if (done) return;
+                  done = true; clearTimeout(timer);
+                  if (error) { activeResponse?.destroy(); activeRequest?.destroy(); reject(error); }
+                  else resolve();
+                };
+                const timer = setTimeout(() => finish(new InspectionStop('Original package download exceeded120seconds')), 120000);
+                const request = (address, redirects) => {
+                  const u = new URL(address);
+                  const allowed = redirects === 0 ? address === PIN.url : u.hostname === 'release-assets.githubusercontent.com';
+                  if (!allowed || u.protocol !== 'https:' || u.username || u.password || (u.port && u.port !== '443') || redirects > 3) {
+                    finish(new InspectionStop('Package redirect is outside the pinned official GitHub delivery route')); return;
+                  }
+                  activeRequest = https.get(u, { headers: { 'User-Agent': 'spaceapp63-public-package-inspection', Accept: 'application/octet-stream' }, rejectUnauthorized: true }, response => {
+                    activeResponse = response;
+                    response.on('error', error => finish(error));
+                    if ([301, 302, 303, 307, 308].includes(response.statusCode)) {
+                      const next = response.headers.location;
+                      response.resume();
+                      if (!next) { finish(new InspectionStop('Package redirect lacks Location')); return; }
+                      try {
+                        const nextURL = new URL(next, u);
+                        record.redirects.push({ host: nextURL.hostname, pathname: nextURL.pathname }); // no signed query values
+                        request(nextURL.href, redirects + 1);
+                      } catch (error) { finish(error); }
+                      return;
+                    }
+                    if (response.statusCode !== 200) { response.resume(); finish(new InspectionStop('Package HTTP status=' + response.statusCode)); return; }
+                    record.final_delivery_host = u.hostname;
+                    response.on('data', chunk => {
+                      if (done) return;
+                      record.downloaded_bytes += chunk.length;
+                      if (record.downloaded_bytes > PIN.bytes) { finish(new InspectionStop('Package exceeds exact published size')); return; }
+                      try { fs.writeSync(fd, chunk); } catch (error) { finish(error); }
+                    });
+                    response.on('end', () => finish());
+                  });
+                  activeRequest.on('error', error => finish(error));
+                };
+                request(PIN.url, 0);
+              });
+            } finally { fs.closeSync(fd); }
+            gate(record.downloaded_bytes === PIN.bytes && fs.lstatSync(destination).size === PIN.bytes, 'Downloaded package size differs from the exact pin');
+            record.sha256 = await hashFile(destination);
+            gate(record.sha256 === PIN.sha256, 'Downloaded package SHA256 differs from the exact pin');
+            record.completed = true; save();
+            return destination;
+          }
+          function namesFromListing(text, label) {
+            const names = text.split(/\r?\n/).filter(Boolean);
+            gate(names.length > 0 && names.length <= maxEntries, label + ': member count is empty or outside bound');
+            for (const original of names) {
+              gate(original.length <= 512 && !/[\x00-\x1f\x7f]/.test(original), label + ': control byte or oversized member name');
+              const name = original === './' ? '.' : original.replace(/^\.\//, '').replace(/\/$/, '');
+              gate(name && !path.posix.isAbsolute(name) && !name.split('/').some(x => x === '..' || x === '') && !name.includes('\\'), label + ': absolute/escaping/ambiguous member name');
+            }
+            return names;
+          }
+          async function inventory(directory) {
+            const records = [];
+            let bytes = 0;
+            async function walk(current) {
+              budget(1000);
+              const entries = await fsp.readdir(current, { withFileTypes: true });
+              gate(entries.length + records.length <= maxEntries, 'Expanded inventory exceeds member bound');
+              entries.sort((a, b) => a.name.localeCompare(b.name, 'en'));
+              for (const entry of entries) {
+                budget(1000);
+                const item = path.join(current, entry.name);
+                const rel = path.relative(directory, item);
+                gate(inside(directory, item) && rel.length <= 512 && !/[\x00-\x1f\x7f]/.test(rel), 'Expanded member has an escaping or unbounded name');
+                const st = await fsp.lstat(item);
+                const value = { path: rel, type: type(st), uid: st.uid, gid: st.gid, mode: st.mode & 0o7777, size: st.size, nlink: st.nlink };
+                records.push(value);
+                gate(records.length <= maxEntries, 'Expanded member count exceeded');
+                if (st.isSymbolicLink()) {
+                  value.link = await fsp.readlink(item);
+                  gate(!path.isAbsolute(value.link), 'Expanded symlink has an absolute target');
+                  value.resolved_relative = path.relative(directory, await fsp.realpath(item));
+                  gate(inside(directory, path.resolve(directory, value.resolved_relative)), 'Expanded symlink leaves its owned tree');
+                  value.contained = true;
+                } else if (st.isDirectory()) {
+                  gate(st.uid === process.getuid(), 'Expanded directory is not owned by the unprivileged caller');
+                  await walk(item);
+                } else {
+                  gate(st.isFile() && st.nlink === 1 && st.uid === process.getuid(), 'Expanded member is special, hard-linked or not caller-owned');
+                  bytes += st.size;
+                  gate(bytes <= maxExpandedBytes, 'Expanded files exceed two GiB');
+                  value.sha256 = await hashFile(item);
+                }
+              }
+            }
+            await walk(directory);
+            return { complete: true, count: records.length, regular_file_bytes: bytes, members: records };
+          }
+          async function exportPublicText(file, publicName, limit) {
+            const st = await fsp.lstat(file);
+            gate(st.isFile() && !st.isSymbolicLink() && st.nlink === 1 && st.size <= limit, 'Public package metadata/script is not a bounded regular file');
+            const bytes = await fsp.readFile(file);
+            const text = bytes.toString('utf8');
+            gate(!text.includes('\0') && Buffer.from(text, 'utf8').equals(bytes), 'Public package metadata/script is not plain UTF8');
+            writePublic(publicName, text);
+            return { path: path.relative(root, file), bytes: bytes.length, sha256: crypto.createHash('sha256').update(bytes).digest('hex'),
+              exported_as: publicName, executed: false };
+          }
+          
+          async function main() {
+            gate(process.platform === 'darwin' && process.arch === 'x64' && process.getuid() !== 0, 'This inspection requires native unprivileged Intel Mac');
+            gate(/^\d+$/.test(process.env.RUN_ID || '') && /^\d+$/.test(process.env.RUN_ATTEMPT || ''), 'Invalid immutable run identity');
+            const temp = fs.realpathSync(process.env.RUNNER_TEMP_PATH);
+            gate(fs.lstatSync(temp).isDirectory(), 'Actual runner.temp is not a directory');
+            root = path.join(temp, `spaceapp63-mac-pkg-inspection-${process.env.RUN_ID}-${process.env.RUN_ATTEMPT}`);
+            gate(!fs.existsSync(root) && !fs.lstatSync(temp).isSymbolicLink(), 'Fresh owned inspection root is not available');
+            fs.mkdirSync(root, { mode: 0o700 });
+            gate(fs.lstatSync(root).uid === process.getuid() && (fs.lstatSync(root).mode & 0o777) === 0o700 && fs.realpathSync(root) === root, 'New inspection root ownership/mode/containment differs');
+            stage = path.join(root, 'stage'); out = path.join(root, 'public'); reportPath = path.join(out, 'report.json');
+            fs.mkdirSync(stage, { mode: 0o700 }); fs.mkdirSync(out, { mode: 0o700 }); fs.mkdirSync(path.join(stage, 'tmp'), { mode: 0o700 });
+            report = { schema_version: 1, started_at_utc: new Date(started).toISOString(), scope: 'public published-package inspection only; extraction is not installation',
+              workflow: { repository: process.env.ACTUAL_REPOSITORY, ref: process.env.ACTUAL_REF, workflow_sha: process.env.WORKFLOW_SHA,
+                run_id: process.env.RUN_ID, run_attempt: process.env.RUN_ATTEMPT, event_name: process.env.EVENT_NAME },
+              source_provenance_only: sourceProvenanceOnly, final_source_bound: false, source_checkout: false,
+              pin: PIN, commands: [], stage: 'native-tool-capability', inspection_complete: false,
+              signer_identity_preapproved: false, extracted_code_execution_authorized: false,
+              package_installed: false, installer_scripts_executed: false, VM_allocated: false, app_acceptance: false,
+              memory_raw_free_guard_retested_or_replaced: false, global_paths_changed_by_this_script: false };
+            save();
+            const fixedPaths = ['/opt/podman', '/usr/local/bin/podman', '/usr/local/bin/podman-mac-helper', '/etc/paths.d/podman-pkg',
+              '/usr/local/etc/man.d/podman.man.conf', '/Library/LaunchDaemons/com.github.containers.podman.helper-runner.plist', '/var/run/docker.sock'];
+            report.preexisting_fixed_paths = fixedPaths.map(p => ({ path: p, metadata: metadata(p) })); save();
+            await command('/usr/bin/sw_vers', [], 3000, 'native OS metadata');
+            const help = await command('/usr/sbin/pkgutil', ['--help'], 3000, 'pkgutil actual capability help');
+            const helpText = help.stdout + help.stderr;
+            gate(['--check-signature', '--expand-full'].every(flag => helpText.includes(flag)), 'Actual pkgutil signature/expansion capability is unknown/unsupported; no expansion');
+            report.pkgutil_payload_listing_help_observed = helpText.includes('--payload-files');
+            const disk = await command('/bin/df', ['-Pk', root], 3000, 'owned scratch actual disk availability');
+            const diskLines = disk.stdout.trim().split(/\n/); const fields = diskLines.at(-1).trim().split(/\s+/);
+            gate(/^\d+$/.test(fields[3] || '') && Number(fields[3]) * 1024 >= 4 * 1024 ** 3, 'Actual scratch free disk below four GiB extraction guard');
+            report.stage = 'one-pinned-package-download'; save();
+            const pkg = await downloadOne();
+            report.stage = 'package-trust-metadata'; save();
+            const signature = await command('/usr/sbin/pkgutil', ['--check-signature', pkg], 30000, 'actual published package signature');
+            const signatureText = signature.stdout + signature.stderr;
+            report.package_signature = { command_exit_code: signature.exit_code,
+              trusted_developer_distribution_text_observed: /Status:\s+signed by a developer certificate issued by Apple for distribution/i.test(signatureText),
+              observed_developer_id_installer_lines: signatureText.split(/\r?\n/).filter(x => /Developer ID Installer:/.test(x)),
+              observed_parenthesized_team_candidates: [...signatureText.matchAll(/Developer ID Installer:[^\n]*\(([A-Z0-9]{10})\)/g)].map(m => m[1]),
+              signer_identity_preapproved: false };
+            gate(report.package_signature.trusted_developer_distribution_text_observed, 'Package signature status is not the required trusted Developer-ID distribution status');
+            const gatekeeper = await command('/usr/sbin/spctl', ['--status'], 3000, 'read-only Gatekeeper status', false);
+            const assessment = await command('/usr/sbin/spctl', ['--assess', '--type', 'install', '--verbose=4', pkg], 30000, 'read-only Gatekeeper install assessment', false);
+            const statusComplete = !gatekeeper.timeout && !gatekeeper.output_limit && !gatekeeper.error_code && gatekeeper.close_observed;
+            const assessmentComplete = !assessment.timeout && !assessment.output_limit && !assessment.error_code && assessment.close_observed;
+            const assessmentAccepted = assessmentComplete && assessment.exit_code === 0 && /:\s+accepted\s*(?:\r?\n|$)/.test(assessment.stdout + assessment.stderr);
+            const assessmentsEnabled = statusComplete && gatekeeper.exit_code === 0 && /assessments enabled/i.test(gatekeeper.stdout + gatekeeper.stderr);
+            report.Gatekeeper = { status_exit_code: gatekeeper.exit_code, status_text: (gatekeeper.stdout + gatekeeper.stderr).trim(),
+              status_complete: statusComplete, assessments_enabled_observed: assessmentsEnabled,
+              assessment_exit_code: assessment.exit_code, assessment_complete: assessmentComplete,
+              assessment_classification: assessmentAccepted ? 'ACCEPTED' : (assessmentComplete ? 'NOT_ACCEPTED_OR_UNSUPPORTED' : 'UNKNOWN'),
+              assessment_accepted_text_observed: assessmentComplete && /:\s+accepted\s*(?:\r?\n|$)/.test(assessment.stdout + assessment.stderr),
+              notarized_developer_id_text_observed: assessmentComplete && /source=Notarized Developer ID/.test(assessment.stdout + assessment.stderr),
+              future_code_execution_trust_gate_passed: assessmentsEnabled && assessmentAccepted,
+              data_only_inspection_not_blocked_by_assessment: true,
+              extracted_code_execution_authorized: false, stapled_ticket_validated: false, policy_changed: false };
+            save();
+            report.stage = 'read-only-archive-lists'; save();
+            const outer = await command('/usr/bin/xar', ['-tf', pkg], 10000, 'public package outer member paths');
+            report.outer_archive_paths = namesFromListing(outer.stdout, 'XAR member list');
+            const payload = await command('/usr/sbin/pkgutil', ['--payload-files', pkg], 15000, 'informational product-archive payload listing', false);
+            report.payload_listing = { exit_code: payload.exit_code, help_flag_observed: report.pkgutil_payload_listing_help_observed,
+              classification: 'UNKNOWN', security_preflight_or_expansion_gate: false, paths: [] };
+            if (payload.timeout || payload.output_limit || payload.error_code || !payload.close_observed) report.payload_listing.classification = 'INCOMPLETE_OR_UNAVAILABLE';
+            else if (payload.exit_code !== 0) report.payload_listing.classification = 'NONZERO_UNSUPPORTED_OR_COMMAND_FAILURE';
+            else if (!payload.stdout.trim()) report.payload_listing.classification = 'EMPTY_PRODUCT_ARCHIVE_LIST';
+            else {
+              try {
+                report.payload_listing.paths = namesFromListing(payload.stdout, 'informational pkgutil output');
+                report.payload_listing.classification = 'RECORDED_PATH_TEXT_NOT_PAYLOAD_PREFLIGHT';
+              } catch (error) {
+                if (!(error instanceof InspectionStop)) throw error;
+                report.payload_listing.classification = 'UNINTERPRETED_PRODUCT_ARCHIVE_OUTPUT';
+                report.payload_listing.interpretation_error = error.message;
+              }
+            }
+            report.expansion_assurance = 'Exact official package size/SHA, trusted Developer-ID package signature, validated outer XAR paths and actual native pkgutil --expand-full into a fresh owned directory. Product payload listing is informational only. Post-inventory rejects escaping links/special files and bounds actual layout/hash reads; it is not a pre-expansion proof of every nested member. No installer/Scripts/extracted code is executed.';
+            report.stage = 'owned-prefix-expand-only'; save();
+            const expanded = path.join(stage, 'expanded');
+            gate(!fs.existsSync(expanded), 'Expansion destination must be fresh and absent');
+            await command('/usr/sbin/pkgutil', ['--expand-full', pkg, expanded], 30000, 'expand verified package into owned scratch without installer');
+            gate(fs.realpathSync(expanded) === expanded && fs.lstatSync(expanded).isDirectory(), 'Expansion root aliases a different path');
+            report.expanded_inventory = await inventory(expanded);
+            writePublic('expanded-inventory.json', JSON.stringify(report.expanded_inventory, null, 2) + '\n');
+            report.expanded_inventory = { complete: true, count: report.expanded_inventory.count, regular_file_bytes: report.expanded_inventory.regular_file_bytes,
+              exported_as: 'expanded-inventory.json' };
+            const component = path.join(expanded, 'podman.pkg');
+            const info = path.join(component, 'PackageInfo');
+            const distribution = path.join(expanded, 'Distribution');
+            report.public_package_text = [];
+            report.public_package_text.push(await exportPublicText(distribution, 'distribution.txt', 65536));
+            report.public_package_text.push(await exportPublicText(info, 'package-info.txt', 65536));
+            const id = await command('/usr/bin/xmllint', ['--nonet', '--xpath', 'string(/pkg-info/@identifier)', info], 3000, 'PackageInfo identifier metadata');
+            const version = await command('/usr/bin/xmllint', ['--nonet', '--xpath', 'string(/pkg-info/@version)', info], 3000, 'PackageInfo version metadata');
+            const installLocation = await command('/usr/bin/xmllint', ['--nonet', '--xpath', 'string(/pkg-info/@install-location)', info], 3000, 'PackageInfo install-location metadata');
+            report.package_layout = { identifier: id.stdout.trim(), version: version.stdout.trim(), install_location: installLocation.stdout.trim(),
+              expected_component_relative_path: 'podman.pkg', expected_payload_bin: 'podman.pkg/Payload/podman/bin' };
+            gate(id.stdout.trim() === PIN.identifier && version.stdout.trim() === PIN.version && installLocation.stdout.trim() === '/opt', 'Actual package identifier/version/layout differs; no fallback or installation');
+            for (const name of ['preinstall', 'postinstall']) {
+              report.public_package_text.push(await exportPublicText(path.join(component, 'Scripts', name), name + '.txt', 16384));
+            }
+            report.stage = 'extracted-code-metadata-only'; report.binaries = []; save();
+            for (const name of ['podman', 'gvproxy', 'vfkit', 'podman-mac-helper']) {
+              const binary = path.join(component, 'Payload', 'podman', 'bin', name);
+              const st = fs.lstatSync(binary);
+              gate(st.isFile() && !st.isSymbolicLink() && st.nlink === 1 && fs.realpathSync(binary) === binary, 'Required actual helper path is not one regular contained binary');
+              const item = { name, path: path.relative(expanded, binary), bytes: st.size, sha256: await hashFile(binary), executed: false };
+              report.binaries.push(item); save();
+              const verify = await command('/usr/bin/codesign', ['--verify', '--strict', '--verbose=4', binary], 30000, name + ' code signature verification');
+              const display = await command('/usr/bin/codesign', ['--display', '--verbose=4', binary], 10000, name + ' code signature metadata');
+              const arch = await command('/usr/bin/lipo', ['-archs', binary], 3000, name + ' architecture metadata');
+              const entitlements = await command('/usr/bin/codesign', ['--display', '--entitlements', '-', binary], 10000, name + ' public entitlement metadata');
+              item.codesign_verify_exit = verify.exit_code;
+              item.architectures = arch.stdout.trim().split(/\s+/).filter(Boolean);
+              item.Intel_architecture_present = item.architectures.includes('x86_64');
+              item.signature_display = (display.stdout + display.stderr).trim();
+              item.entitlements_stdout = entitlements.stdout;
+              item.entitlements_stderr = entitlements.stderr;
+              item.team_identifier = (item.signature_display.match(/^TeamIdentifier=(.*)$/m) || [])[1] || null;
+              item.vfkit_declared_virtualization_entitlement = name === 'vfkit' ? /<key>com\.apple\.security\.virtualization<\/key>\s*<true\s*\/>/.test(entitlements.stdout + entitlements.stderr) : null;
+              gate(item.Intel_architecture_present, 'Extracted binary lacks observed x86_64 architecture; no binary execution');
+            }
+            report.post_fixed_paths = fixedPaths.map(p => ({ path: p, metadata: metadata(p) }));
+            report.fixed_path_metadata_unchanged = JSON.stringify(report.preexisting_fixed_paths) === JSON.stringify(report.post_fixed_paths);
+            gate(report.fixed_path_metadata_unchanged, 'Preexisting fixed-path metadata differs; origin not assumed');
+            gate(fs.lstatSync(pkg).size === PIN.bytes && await hashFile(pkg) === PIN.sha256, 'Original package bytes changed during inspection');
+            report.inspection_complete = true;
+            report.stage = 'inspection-terminal-no-install-or-execution';
+            report.result_limit = 'Trusted-package/tool/metadata observations only. TeamID/publisher/layout require independent review; signatures do not authorize executing code. No final-source, VM, memory, app, owner or bounty acceptance.';
+            report.retention = { uploaded: 'public text/json only, at most four MiB', package_and_payload_uploaded: false,
+              package_and_payload_location: 'owned runner scratch only until normal disposable-runner teardown; no system installation', deleted_by_this_script: false };
+            save();
+            const publicMembers = fs.readdirSync(out).map(name => ({ name, ...metadata(path.join(out, name)) }));
+            gate(publicMembers.every(x => x.type === 'regular' && /\.(json|txt)$/.test(x.name)), 'Final export is not exclusively ordinary metadata files');
+            process.stdout.write(JSON.stringify({ report: reportPath, inspection_complete: true, app_acceptance: false, public_bytes: publicSize() }) + '\n');
+          }
+          
+          main().catch(error => {
+            if (currentChild && Number.isInteger(currentChild.pid) && !currentChildRecord?.owned_group_kill_requested && currentChild.exitCode === null && currentChild.signalCode === null) {
+              try {
+                process.kill(-currentChild.pid, 'SIGKILL');
+                if (currentChildRecord) currentChildRecord.final_catch_owned_kill_requested = true;
+              } catch (error) { if (currentChildRecord) currentChildRecord.final_catch_kill_error_code = error.code || 'UNKNOWN'; }
+            }
+            if (report) {
+              report.inspection_complete = false;
+              report.terminal_error = { name: error.name, message: String(error.message).slice(0, 1200), code: error.code || null };
+              report.extracted_code_execution_authorized = false;
+              try { save(); } catch (e) { process.stderr.write('owned report write failed: ' + (e.code || e.name) + '\n'); }
+            }
+            process.stderr.write('inspection stopped: ' + error.name + ': ' + String(error.message).slice(0, 1200) + '\n');
+            process.exitCode = 78;
+          });
+          NODE_PACKAGE_INSPECTION
+
+      - name: Preserve bounded public package metadata only
+        if: ${{ always() && steps.repository_guard.outcome == 'success' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: spaceapp63-mac-pkg-inspection-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/spaceapp63-mac-pkg-inspection-${{ github.run_id }}-${{ github.run_attempt }}/public
+          if-no-files-found: warn
+          retention-days: 7
