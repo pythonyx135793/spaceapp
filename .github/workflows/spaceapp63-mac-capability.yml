@@ -1,0 +1,269 @@
+name: Issue 63 Intel Mac capability metadata only
+
+on:
+  push:
+    branches:
+      - codex/spaceapp63-mac-capability-cp395-r85
+    paths:
+      - .github/workflows/spaceapp63-mac-capability.yml
+
+permissions:
+  contents: read
+
+jobs:
+  capability_metadata:
+    runs-on: macos-15-intel
+    timeout-minutes: 10
+    steps:
+      - name: Guard the one public fork and branch
+        id: repository_guard
+        env:
+          EXPECTED_REPOSITORY: pythonyx135793/spaceapp
+          ACTUAL_REPOSITORY: ${{ github.repository }}
+          EVENT_REPOSITORY: ${{ github.event.repository.full_name }}
+          EVENT_FORK: ${{ github.event.repository.fork }}
+          EVENT_PRIVATE: ${{ github.event.repository.private }}
+          EVENT_NAME: ${{ github.event_name }}
+          EXPECTED_REF: refs/heads/codex/spaceapp63-mac-capability-cp395-r85
+          ACTUAL_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          test "$ACTUAL_REPOSITORY" = "$EXPECTED_REPOSITORY"
+          test "$EVENT_REPOSITORY" = "$EXPECTED_REPOSITORY"
+          test "$EVENT_FORK" = "true"
+          test "$EVENT_PRIVATE" = "false"
+          test "$EVENT_NAME" = "push"
+          test "$ACTUAL_REF" = "$EXPECTED_REF"
+
+      - name: Collect bounded host capability metadata only
+        id: host_metadata
+        env:
+          SOURCE_SHA17: 562203048cf075fe36e47f87f9368034f7f73507
+          ACTUAL_REPOSITORY: ${{ github.repository }}
+          ACTUAL_REF: ${{ github.ref }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          EVENT_FORK: ${{ github.event.repository.fork }}
+          EVENT_VISIBILITY: ${{ github.event.repository.visibility }}
+          EVENT_PARENT: ${{ github.event.repository.parent.full_name }}
+          RUNNER_TEMP_PATH: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          'use strict';
+          const fs = require('node:fs');
+          const os = require('node:os');
+          const path = require('node:path');
+          const { spawnSync } = require('node:child_process');
+
+          const GiB = 1024 ** 3;
+          const commandTimeoutMs = 3000;
+          const outputLimit = 1200;
+          const reportPath = path.join(
+            process.env.RUNNER_TEMP_PATH,
+            `spaceapp63-mac-capability-${process.env.RUN_ID}-${process.env.RUN_ATTEMPT}.json`
+          );
+          const report = {
+            schema_version: 1,
+            collected_at_utc: new Date().toISOString(),
+            scope: 'bounded native host metadata only; no install, download, VM start, or app test',
+            workflow: {
+              repository: process.env.ACTUAL_REPOSITORY,
+              ref: process.env.ACTUAL_REF,
+              workflow_sha: process.env.WORKFLOW_SHA,
+              run_id: process.env.RUN_ID,
+              run_attempt: process.env.RUN_ATTEMPT,
+              event_fork: process.env.EVENT_FORK,
+              event_visibility: process.env.EVENT_VISIBILITY,
+              event_parent: process.env.EVENT_PARENT
+            },
+            source_sha17_provenance_only: process.env.SOURCE_SHA17,
+            source_commit_attested: false,
+            node: {},
+            commands: {},
+            fixed_path_lstat: [],
+            selected_vm_helper_processes: { matches: [], truncated: false, observation_complete: false },
+            eligibility: {
+              can_attempt_metadata: false,
+              conditions: {},
+              thresholds: {
+                native_darwin: true,
+                node_arch_x64: true,
+                non_root: true,
+                kern_hv_support: 1,
+                effective_cpu_count_minimum: 4,
+                physical_memory_bytes_minimum: 13 * GiB,
+                node_free_memory_bytes_minimum: 9 * GiB,
+                runner_temp_free_bytes_minimum: 30 * GiB
+              },
+              interpretation: 'A pass only permits a separately reviewed follow-up attempt. This report does not prove Hypervisor.framework use, Podman installation, VM startup, or application behavior.'
+            },
+            virtualization_tested: false,
+            podman_started: false
+          };
+
+          function boundedText(value) {
+            const text = String(value || '').replace(/\u0000/g, '').trim();
+            return text.length > outputLimit ? `${text.slice(0, outputLimit)}[truncated]` : text;
+          }
+
+          function run(label, executable, args, includeOutput = true) {
+            const result = spawnSync(executable, args, {
+              encoding: 'utf8',
+              timeout: commandTimeoutMs,
+              maxBuffer: 64 * 1024,
+              windowsHide: true,
+              shell: false
+            });
+            const item = {
+              executable,
+              args,
+              exit_code: Number.isInteger(result.status) ? result.status : null,
+              signal: result.signal || null,
+              error: result.error ? boundedText(`${result.error.name}: ${result.error.message}`) : null
+            };
+            if (includeOutput) {
+              item.stdout = boundedText(result.stdout);
+              item.stderr = boundedText(result.stderr);
+            }
+            report.commands[label] = item;
+            return { item, stdout: String(result.stdout || ''), stderr: String(result.stderr || '') };
+          }
+
+          function numeric(value) {
+            const match = String(value || '').match(/^\s*(\d+)\s*$/);
+            return match ? Number(match[1]) : null;
+          }
+
+          function lstatFact(filePath) {
+            try {
+              const s = fs.lstatSync(filePath);
+              return {
+                path: filePath,
+                exists: true,
+                kind: s.isSymbolicLink() ? 'symlink' : s.isDirectory() ? 'directory' : s.isFile() ? 'file' : 'other',
+                mode_octal: (s.mode & 0o7777).toString(8),
+                uid: s.uid,
+                gid: s.gid,
+                size_bytes: s.size
+              };
+            } catch (error) {
+              return {
+                path: filePath,
+                exists: false,
+                error: boundedText(`${error.code || error.name}: ${error.message}`)
+              };
+            }
+          }
+
+          function writeReport() {
+            fs.writeFileSync(reportPath, `${JSON.stringify(report, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+          }
+
+          try {
+            const nodeParallelism = typeof os.availableParallelism === 'function'
+              ? os.availableParallelism()
+              : os.cpus().length;
+            report.node = {
+              version: process.version,
+              platform: process.platform,
+              arch: process.arch,
+              available_parallelism: nodeParallelism,
+              visible_cpu_count: os.cpus().length,
+              free_memory_bytes: os.freemem(),
+              total_memory_bytes: os.totalmem()
+            };
+
+            run('sw_vers', '/usr/bin/sw_vers', []);
+            run('uname', '/usr/bin/uname', ['-s', '-m']);
+            const idResult = run('id_uid', '/usr/bin/id', ['-u']);
+            const sysctl = {};
+            for (const key of ['kern.hv_support', 'hw.logicalcpu', 'hw.activecpu', 'hw.memsize']) {
+              const result = run(`sysctl_${key.replaceAll('.', '_')}`, '/usr/sbin/sysctl', ['-n', key]);
+              sysctl[key] = result.item.exit_code === 0 ? numeric(result.stdout) : null;
+            }
+            report.sysctl = sysctl;
+            run('vm_stat', '/usr/bin/vm_stat', []);
+            run('memory_pressure_Q', '/usr/bin/memory_pressure', ['-Q']);
+            const df = run('runner_temp_df', '/bin/df', ['-Pk', process.env.RUNNER_TEMP_PATH]);
+            const dfLines = df.stdout.trim().split(/\r?\n/);
+            const dfFields = dfLines.length > 1 ? dfLines[dfLines.length - 1].trim().split(/\s+/) : [];
+            const availableKiB = dfFields.length >= 4 ? numeric(dfFields[3]) : null;
+            report.runner_temp = {
+              path: process.env.RUNNER_TEMP_PATH,
+              df_available_kib: availableKiB,
+              free_bytes: availableKiB === null ? null : availableKiB * 1024,
+              df_parse_succeeded: availableKiB !== null && df.item.exit_code === 0
+            };
+
+            const fixedPaths = [
+              '/opt/podman',
+              '/usr/local/bin/podman',
+              '/usr/local/bin/podman-mac-helper',
+              '/opt/homebrew/bin/podman',
+              '/opt/homebrew/bin/podman-mac-helper',
+              '/Applications/Podman Desktop.app'
+            ];
+            report.fixed_path_lstat = fixedPaths.map(lstatFact);
+
+            const ps = run('selected_process_names', '/bin/ps', ['-A', '-o', 'pid=', '-o', 'comm='], false);
+            const psLines = ps.stdout.split(/\r?\n/);
+            const helperPattern = /^(podman|podman-mac-helper|vfkit|gvproxy|virtiofsd|hyperkit|limactl|lima|krun|qemu-system(?:-.+)?)$/i;
+            const helpers = [];
+            for (const line of psLines) {
+              const match = line.trim().match(/^(\d+)\s+(.+)$/);
+              if (!match) continue;
+              const name = path.basename(match[2].trim());
+              if (helperPattern.test(name)) helpers.push({ pid: Number(match[1]), comm: name.slice(0, 120) });
+            }
+            report.selected_vm_helper_processes = {
+              matches: helpers.slice(0, 20),
+              truncated: helpers.length > 20,
+              observation_complete: ps.item.exit_code === 0 && !ps.item.error,
+              command_exit_code: ps.item.exit_code,
+              command_error: ps.item.error
+            };
+
+            const hypervisorSupport = sysctl['kern.hv_support'];
+            const logicalCpu = sysctl['hw.logicalcpu'];
+            const activeCpu = sysctl['hw.activecpu'];
+            const conservativeCpuCount = [logicalCpu, activeCpu, nodeParallelism]
+              .every(Number.isFinite) ? Math.min(logicalCpu, activeCpu, nodeParallelism) : null;
+            const idUid = idResult.item.exit_code === 0 ? numeric(idResult.stdout) : null;
+            const physicalMemory = sysctl['hw.memsize'];
+            const freeMemory = report.node.free_memory_bytes;
+            const diskFree = report.runner_temp.free_bytes;
+            const conditions = {
+              native_darwin: process.platform === 'darwin',
+              node_arch_x64: process.arch === 'x64',
+              non_root: idUid !== null && idUid !== 0,
+              kern_hv_support: hypervisorSupport === 1,
+              effective_cpu_count_minimum: conservativeCpuCount !== null && conservativeCpuCount >= 4,
+              physical_memory_bytes_minimum: Number.isFinite(physicalMemory) && physicalMemory >= 13 * GiB,
+              node_free_memory_bytes_minimum: Number.isFinite(freeMemory) && freeMemory >= 9 * GiB,
+              runner_temp_free_bytes_minimum: Number.isFinite(diskFree) && diskFree >= 30 * GiB
+            };
+            report.eligibility.effective_cpu_count_observed = conservativeCpuCount;
+            report.eligibility.available_memory_measurement = 'Node os.freemem() free-memory proxy; memory_pressure -Q output is retained without interpretation.';
+            report.eligibility.conditions = conditions;
+            report.eligibility.can_attempt_metadata = Object.values(conditions).every(Boolean);
+            writeReport();
+          } catch (error) {
+            report.probe_error = boundedText(`${error.name}: ${error.message}`);
+            try { writeReport(); } catch (writeError) {
+              process.stderr.write(`report_write_error=${boundedText(`${writeError.name}: ${writeError.message}`)}\n`);
+            }
+            process.exitCode = 1;
+          }
+          NODE
+
+      - name: Preserve metadata report
+        if: ${{ always() && steps.repository_guard.outcome == 'success' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: spaceapp63-mac-capability-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/spaceapp63-mac-capability-${{ github.run_id }}-${{ github.run_attempt }}.json
+          if-no-files-found: warn
+          retention-days: 7
+
