@@ -83,6 +83,7 @@ const publicScripts = new Set([
   "scripts/ci/native-apt-source.test.mjs",
   "scripts/ci/native-host-prereqs.mjs",
   "scripts/ci/native-host-prereqs.test.mjs",
+  "scripts/ci/native-engine-info.test.mjs",
   "scripts/ci/native-apt-keyring.py",
   "scripts/ci/native-apt-keyring.test.py",
   // Loaded by apps/api/src/cli-render-proof-fixture.ts (proof rooms); missing, that path failed (review F18).

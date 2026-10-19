@@ -115,3 +115,38 @@ export function validateNativeSessionAndStorage(facts, uid, required, headroom) 
   const storage = facts.storage;
   requireFact(storage?.fresh === true && [0xef53, 0x58465342].includes(storage.filesystemType) && Number.isSafeInteger(storage.freeBytes) && storage.freeBytes >= required.freshDiskBytes + headroom && Number.isSafeInteger(storage.freeInodes) && storage.freeInodes >= 250000, "Native fresh storage/available capacity differs; safe facts retained");
 }
+
+export function nativeEngineIdentity(info) {
+  return { version: info?.version?.Version, commit: info?.version?.GitCommit, rootless: info?.host?.security?.rootless, cgroupVersion: info?.host?.cgroupVersion, cgroupManager: info?.host?.cgroupManager, graphRoot: info?.store?.graphRoot, runRoot: info?.store?.runRoot, runtime: info?.host?.ociRuntime?.path };
+}
+
+export function nativeEngineResources(info) {
+  const bounded = (value) => Number.isSafeInteger(value) && value >= 0 ? value : null;
+  return { cpuCount: bounded(info?.host?.cpus), memoryBytes: bounded(info?.host?.memTotal) };
+}
+
+export function nativeEngineStorageFacts(info) {
+  const store = info?.store;
+  const known = (value, choices) => choices.includes(value) ? value : null;
+  const options = JSON.stringify(store?.graphOptions ?? {});
+  return { driver: known(store?.graphDriverName, ["overlay", "vfs", "btrfs", "zfs"]),
+    backingFilesystem: known(store?.graphStatus?.["Backing Filesystem"], ["extfs", "xfs", "btrfs", "overlayfs", "zfs", "tmpfs"]),
+    nativeOverlayDiff: known(store?.graphStatus?.["Native Overlay Diff"], ["true", "false"]),
+    supportsDType: known(store?.graphStatus?.["Supports d_type"], ["true", "false"]),
+    hasMountProgramOption: /mount_program/i.test(options),
+    hasIgnoredChownErrors: /ignore_chown_errors[^,}\]]*(?:true|[=:]1)/i.test(options) };
+}
+
+export function validateNativeEngineInfo(local, api, expected) {
+  const identity = nativeEngineIdentity(local);
+  requireFact(JSON.stringify(identity) === JSON.stringify(nativeEngineIdentity(api)) && identity.version === expected.version && identity.commit === expected.commit && identity.rootless === true && identity.runtime === expected.runtime && identity.cgroupVersion === "v2" && identity.cgroupManager === "systemd", "Native CLI/API version, rootless store or selected OCI runtime differs");
+  for (const [name, info] of [["native CLI", local], ["rootless API", api]]) {
+    const host = info?.host, security = host?.security;
+    requireFact(Array.isArray(host?.cgroupControllers) && ["cpu", "memory"].every((controller) => host.cgroupControllers.includes(controller)), `Actual CPU/memory controllers are not delegated (${name})`);
+    // Exact Podman6.1.4 AppArmor verifier rejects rootless before checking the host.
+    // Host policy/build tags and actual mappings remain separate mandatory gates.
+    // This false info value does not claim per-container AppArmor confinement.
+    requireFact(security?.rootless === true && security.seccompEnabled === true && security.apparmorEnabled === false, `Actual rootless engine security prerequisites differ (${name})`);
+    requireFact(positive(host.cpus) && positive(host.memTotal) && host.cpus >= expected.required.cpuCount && host.memTotal >= expected.required.memoryBytes, `Actual engine CPU/memory prerequisites failed (${name})`);
+  }
+}

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
+import "./native-engine-info.test.mjs";
 import { analyzeSubordinateRanges, analyzeVendorProfile, NATIVE_APPARMOR_VERSION, NATIVE_EXECUTABLES, nativePolicyObservation, nativeRuntimeConfig, validateNativeDestinations, validateNativeMappings, validateNativePolicies, validateNativeSessionAndStorage } from "./native-host-prereqs.mjs";
 
 // Exact Canonical835ca4d0785bc87bfc44b46a6124644310a31bfe policy fixtures.

@@ -10,7 +10,7 @@ import { fileURLToPath } from "node:url";
 import { waitForTimedCommand } from "../../packages/run-spaceapp/src/command-timeout.mjs";
 import { composeCommand, composeProjectName, PROFILE_REQUIREMENTS, profileRuntimeSettings } from "../../packages/run-spaceapp/src/index.mjs";
 import { NATIVE_APT_KEYRING, nativeAptInputFacts, planOwnedNativeAptSources, readNativeAptInputs, validateNativeAptInputs } from "./native-apt-source.mjs";
-import { analyzeSubordinateRanges, NATIVE_EXECUTABLES, nativePolicyObservation, nativeRuntimeConfig, trustedNativeFile, validateNativeDestinations, validateNativeMappings, validateNativePolicies, validateNativeSessionAndStorage } from "./native-host-prereqs.mjs";
+import { analyzeSubordinateRanges, NATIVE_EXECUTABLES, nativeEngineIdentity, nativeEngineResources, nativeEngineStorageFacts, nativePolicyObservation, nativeRuntimeConfig, trustedNativeFile, validateNativeDestinations, validateNativeEngineInfo, validateNativeMappings, validateNativePolicies, validateNativeSessionAndStorage } from "./native-host-prereqs.mjs";
 
 const MINUTE = 60_000, GIB = 1024 ** 3, HEADROOM = 512 * 1024 ** 2;
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -564,13 +564,10 @@ async function engineIdentity() {
   requireThat(socket.isSocket() && !socket.isSymbolicLink() && socket.uid === process.getuid() && socket.gid === process.getgid() && (socket.mode & 0o007) === 0, "API socket is not the private selected rootless user socket");
   const local = await podmanJson(["--remote=false", "info", "--format", "json"]);
   const remote = await podmanJson(["--remote", "--url", `unix://${state.runtimeDir}/podman/podman.sock`, "info", "--format", "json"]);
-  const key = (info) => ({ version: info.version?.Version, commit: info.version?.GitCommit, rootless: info.host?.security?.rootless, cgroupVersion: info.host?.cgroupVersion, cgroupManager: info.host?.cgroupManager, graphRoot: info.store?.graphRoot, runRoot: info.store?.runRoot, runtime: info.host?.ociRuntime?.path });
-  const expected = key(local);
-  await artifact("cli-api-observed.json", { local: expected, api: key(remote), localControllers: local.host?.cgroupControllers, apiControllers: remote.host?.cgroupControllers, localSecurity: local.host?.security, apiSecurity: remote.host?.security });
-  requireThat(JSON.stringify(expected) === JSON.stringify(key(remote)) && expected.version === "6.1.4" && expected.commit === SOURCES.at(-1)[2] && expected.rootless === true && expected.runtime === NATIVE_EXECUTABLES.runc.path && expected.cgroupVersion === "v2" && expected.cgroupManager === "systemd", "Native CLI/API version, rootless store or selected OCI runtime differs");
+  const expected = nativeEngineIdentity(local);
+  await artifact("cli-api-observed.json", { local: expected, api: nativeEngineIdentity(remote), localControllers: local.host?.cgroupControllers, apiControllers: remote.host?.cgroupControllers, localSecurity: local.host?.security, apiSecurity: remote.host?.security, localResources: nativeEngineResources(local), apiResources: nativeEngineResources(remote), localStorage: nativeEngineStorageFacts(local), apiStorage: nativeEngineStorageFacts(remote) });
+  validateNativeEngineInfo(local, remote, { version: "6.1.4", commit: SOURCES.at(-1)[2], runtime: NATIVE_EXECUTABLES.runc.path, required: REQUIRED });
   const controllers = local.host.cgroupControllers;
-  requireThat(Array.isArray(controllers) && ["cpu", "memory"].every((name) => controllers.includes(name)), "Actual CPU/memory controllers are not delegated");
-  requireThat(local.host.security.seccompEnabled === true && local.host.security.apparmorEnabled === true && local.host.cpus >= REQUIRED.cpuCount && local.host.memTotal >= REQUIRED.memoryBytes, "Actual engine security/resource prerequisites failed");
   const graph = await realpath(expected.graphRoot);
   requireThat(within(process.env.HOME, graph) && (await lstat(graph)).uid === process.getuid() && local.store.graphDriverName === "overlay", "Selected native storage is not this rootless user's overlay store");
   requireThat(["extfs", "xfs"].includes(local.store.graphStatus?.["Backing Filesystem"]) && local.store.graphStatus?.["Native Overlay Diff"] === "true" && local.store.graphStatus?.["Supports d_type"] === "true", "Unreviewed native overlay backing filesystem/features");
