@@ -1,0 +1,105 @@
+name: Issue63 native APT metadata only
+
+on:
+  push:
+    branches:
+      - codex/spaceapp63-apt-metadata-cp395-r85
+    paths:
+      - .github/workflows/spaceapp63-apt-metadata.yml
+
+permissions:
+  contents: read
+
+jobs:
+  metadata-only:
+    if: >-
+      ${{ github.repository == 'pythonyx135793/spaceapp' &&
+          github.event.repository.private == false &&
+          github.event_name == 'push' &&
+          github.ref == 'refs/heads/codex/spaceapp63-apt-metadata-cp395-r85' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22.23.0"
+      - name: Collect bounded public APT source facts without provisioning
+        id: capture
+        timeout-minutes: 1
+        shell: bash
+        env:
+          OUTPUT_JSON: ${{ runner.temp }}/spaceapp63-apt-metadata-${{ github.run_id }}-${{ github.run_attempt }}.json
+        run: |
+          node --input-type=module <<'NODE'
+          import { lstat, readFile, realpath, writeFile, appendFile } from 'node:fs/promises';
+          import { createHash } from 'node:crypto';
+          import { execFileSync } from 'node:child_process';
+          const sha = bytes => createHash('sha256').update(bytes).digest('hex');
+          const errors = [];
+          async function input(path, maximum, includeText = false) {
+            try {
+              const before = await lstat(path);
+              const canonical = await realpath(path);
+              const facts = { path, realpath: canonical, uid: before.uid, gid: before.gid, mode: (before.mode & 0o7777).toString(8), bytes: before.size };
+              const trusted = before.isFile() && !before.isSymbolicLink() && canonical === path && before.uid === 0 && !(before.mode & 0o022) && before.size <= maximum;
+              if (!trusted) { errors.push(`Untrusted fixed metadata input: ${path}`); return { ...facts, trusted: false }; }
+              const bytes = await readFile(path), after = await lstat(path);
+              if (bytes.length > maximum || before.ino !== after.ino || before.dev !== after.dev || before.size !== after.size || before.mtimeMs !== after.mtimeMs) throw Error('Input changed during capture');
+              return { ...facts, trusted: true, sha256: sha(bytes), ...(includeText ? { text: bytes.toString('utf8') } : {}) };
+            } catch { errors.push(`Fixed metadata input unavailable: ${path}`); return { path, trusted: false, error: 'unavailable or changed' }; }
+          }
+          function uri(value) {
+            if (value === 'mirror+file:/etc/apt/apt-mirrors.txt') return { value, kind: 'pinned-image-mirror-file' };
+            try {
+              const parsed = new URL(value);
+              const publicOrigin = ['http:', 'https:'].includes(parsed.protocol) && ['azure.archive.ubuntu.com', 'archive.ubuntu.com', 'security.ubuntu.com'].includes(parsed.hostname) && parsed.pathname === '/ubuntu/' && !parsed.username && !parsed.password && !parsed.port && !parsed.search && !parsed.hash;
+              return publicOrigin ? { value, kind: 'reviewed-public-Ubuntu-origin' } : { scheme: parsed.protocol, hostname: parsed.hostname, suppressedUnreviewedDetails: true, credentialsOrQueryPresent: Boolean(parsed.username || parsed.password || parsed.search || parsed.hash) };
+            } catch { return { malformed: true, valueSuppressed: true }; }
+          }
+          function publicTokens(value) { return value?.split(/\s+/).filter(Boolean).map(token => /^[a-z0-9][a-z0-9-]{0,40}$/i.test(token) ? token : '[unreviewed-token]') ?? []; }
+          const source = await input('/etc/apt/sources.list.d/ubuntu.sources', 65536, true);
+          const mirror = await input('/etc/apt/apt-mirrors.txt', 16384, true);
+          const keyring = await input('/usr/share/keyrings/ubuntu-archive-keyring.gpg', 2 * 1024 * 1024);
+          if (source.text !== undefined) {
+            source.stanzas = source.text.split('\n').filter(line => !line.trim().startsWith('#')).join('\n').trim().split(/\n\s*\n/).map(stanza => {
+              const fields = {}; let last; let malformed = false;
+              for (const line of stanza.split('\n')) {
+                if (/^\s/.test(line) && last) { fields[last] += ` ${line.trim()}`; continue; }
+                const found = line.match(/^([A-Za-z-]+):\s*(.*)$/);
+                if (!found || Object.hasOwn(fields, found[1])) { malformed = true; continue; }
+                last = found[1]; fields[last] = found[2];
+              }
+              return { malformed, fieldNames: Object.keys(fields), types: publicTokens(fields.Types), suites: publicTokens(fields.Suites), components: publicTokens(fields.Components), signedBy: fields['Signed-By'] === '/usr/share/keyrings/ubuntu-archive-keyring.gpg' ? fields['Signed-By'] : '[unreviewed-keyring-path]', uris: fields.URIs?.split(/\s+/).filter(Boolean).map(uri) ?? [] };
+            });
+            delete source.text;
+          }
+          if (mirror.text !== undefined) {
+            mirror.entries = mirror.text.split(/\r?\n/).filter(line => line.trim() && !line.trim().startsWith('#')).slice(0, 32).map(line => {
+              const [url, ...options] = line.trim().split(/\s+/);
+              return { uri: uri(url), options: options.map(option => /^priority:[0-9]{1,3}$/.test(option) ? option : '[unreviewed-option]') };
+            });
+            mirror.truncated = mirror.text.split(/\r?\n/).filter(line => line.trim() && !line.trim().startsWith('#')).length > 32;
+            delete mirror.text;
+          }
+          const versions = {};
+          for (const [name, executable, args] of [
+            ['apt', '/usr/bin/apt-get', ['--version']],
+            ['packages', '/usr/bin/dpkg-query', ['-W', '-f=${Package}\t${Version}\n', 'apt', 'ubuntu-keyring', 'base-files']]
+          ]) {
+            try { versions[name] = execFileSync(executable, args, { encoding: 'utf8', timeout: 5000, maxBuffer: 65536 }).trim(); }
+            catch { errors.push(`Read-only version command failed: ${name}`); }
+          }
+          const os = await readFile('/etc/os-release', 'utf8');
+          const result = { diagnosticOnly: true, provisioningAttempted: false, nativeAptSourceAccepted: null, declaredBaseCandidate: '2bfff587f63500a97b212e551df8702db71ff54f', orchestrationCommit: process.env.GITHUB_SHA, imageVersion: process.env.ImageVersion ?? null, expectedPriorImageVersion: '20261012.334.1', osRelease: os, node: process.version, platform: process.platform, arch: process.arch, uid: process.getuid(), source, mirror, keyring, versions, errors };
+          await writeFile(process.env.OUTPUT_JSON, `${JSON.stringify(result, null, 2)}\n`, { mode: 0o600, flag: 'wx' });
+          await appendFile(process.env.GITHUB_OUTPUT, 'sanitized=true\n');
+          console.log(JSON.stringify({ diagnosticOnly: true, outputWritten: true, provisioningAttempted: false, errors: errors.length }));
+          if (errors.length) process.exitCode = 1;
+          NODE
+      - name: Preserve sanitized native-source metadata only
+        if: ${{ always() && steps.capture.outputs.sanitized == 'true' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: issue63-native-apt-metadata-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/spaceapp63-apt-metadata-${{ github.run_id }}-${{ github.run_attempt }}.json
+          if-no-files-found: error
