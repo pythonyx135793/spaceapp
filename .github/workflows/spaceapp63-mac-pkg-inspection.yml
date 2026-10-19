@@ -3,7 +3,7 @@ name: Issue 63 Intel Mac published package inspection only
 on:
   push:
     branches:
-      - codex/spaceapp63-mac-pkg-inspect-cp395-r85
+      - codex/spaceapp63-mac-pkg-help-cp395-r85
     paths:
       - .github/workflows/spaceapp63-mac-pkg-inspection.yml
 
@@ -24,7 +24,7 @@ jobs:
           EVENT_FORK: ${{ github.event.repository.fork }}
           EVENT_PRIVATE: ${{ github.event.repository.private }}
           EVENT_NAME: ${{ github.event_name }}
-          EXPECTED_REF: refs/heads/codex/spaceapp63-mac-pkg-inspect-cp395-r85
+          EXPECTED_REF: refs/heads/codex/spaceapp63-mac-pkg-help-cp395-r85
           ACTUAL_REF: ${{ github.ref }}
         shell: bash
         run: |
@@ -363,7 +363,7 @@ jobs:
               workflow: { repository: process.env.ACTUAL_REPOSITORY, ref: process.env.ACTUAL_REF, workflow_sha: process.env.WORKFLOW_SHA,
                 run_id: process.env.RUN_ID, run_attempt: process.env.RUN_ATTEMPT, event_name: process.env.EVENT_NAME },
               source_provenance_only: sourceProvenanceOnly, final_source_bound: false, source_checkout: false,
-              pin: PIN, commands: [], stage: 'native-tool-capability', inspection_complete: false,
+              pin: PIN, commands: [], stage: 'native-tool-metadata', inspection_complete: false,
               signer_identity_preapproved: false, extracted_code_execution_authorized: false,
               package_installed: false, installer_scripts_executed: false, VM_allocated: false, app_acceptance: false,
               memory_raw_free_guard_retested_or_replaced: false, global_paths_changed_by_this_script: false };
@@ -372,10 +372,16 @@ jobs:
               '/usr/local/etc/man.d/podman.man.conf', '/Library/LaunchDaemons/com.github.containers.podman.helper-runner.plist', '/var/run/docker.sock'];
             report.preexisting_fixed_paths = fixedPaths.map(p => ({ path: p, metadata: metadata(p) })); save();
             await command('/usr/bin/sw_vers', [], 3000, 'native OS metadata');
-            const help = await command('/usr/sbin/pkgutil', ['--help'], 3000, 'pkgutil actual capability help');
+            const help = await command('/usr/sbin/pkgutil', ['--help'], 3000, 'pkgutil usage metadata');
             const helpText = help.stdout + help.stderr;
-            gate(['--check-signature', '--expand-full'].every(flag => helpText.includes(flag)), 'Actual pkgutil signature/expansion capability is unknown/unsupported; no expansion');
+            report.pkgutil_help_metadata = { command_index: report.commands.length - 1, exit_code: help.exit_code,
+              advertised_check_signature: helpText.includes('--check-signature'),
+              advertised_expand_full: helpText.includes('--expand-full'),
+              advertised_payload_files: helpText.includes('--payload-files'),
+              advertisement_is_capability_proof: false,
+              expansion_capability: 'UNOBSERVED_UNTIL_ORIGINAL_FIXED_EXPANSION_COMMAND' };
             report.pkgutil_payload_listing_help_observed = helpText.includes('--payload-files');
+            save();
             const disk = await command('/bin/df', ['-Pk', root], 3000, 'owned scratch actual disk availability');
             const diskLines = disk.stdout.trim().split(/\n/); const fields = diskLines.at(-1).trim().split(/\s+/);
             gate(/^\d+$/.test(fields[3] || '') && Number(fields[3]) * 1024 >= 4 * 1024 ** 3, 'Actual scratch free disk below four GiB extraction guard');
@@ -429,7 +435,20 @@ jobs:
             report.stage = 'owned-prefix-expand-only'; save();
             const expanded = path.join(stage, 'expanded');
             gate(!fs.existsSync(expanded), 'Expansion destination must be fresh and absent');
-            await command('/usr/sbin/pkgutil', ['--expand-full', pkg, expanded], 30000, 'expand verified package into owned scratch without installer');
+            const expansionCommandIndex = report.commands.length;
+            try {
+              await command('/usr/sbin/pkgutil', ['--expand-full', pkg, expanded], 30000, 'expand verified package into owned scratch without installer');
+            } finally {
+              // Preserve the original required-zero result, including failure/cleanup uncertainty.
+              const result = report.commands[expansionCommandIndex];
+              const complete = result && !result.timeout && !result.output_limit && !result.error_code && result.close_observed && result.cleanup_confirmed;
+              report.expansion_capability_observation = { original_command_index: result ? expansionCommandIndex : null,
+                attempts: result ? 1 : 0, original_result_required_zero: true, capability_inferred_from_help: false,
+                result: !result ? 'NOT_STARTED' : !complete ? 'ORIGINAL_INCOMPLETE_OR_UNAVAILABLE'
+                  : result.exit_code === 0 ? 'ORIGINAL_EXIT_ZERO_LAYOUT_UNCHECKED' : 'ORIGINAL_NONZERO_UNCLASSIFIED',
+                layout_verified: false, fallback_attempted: false };
+              save();
+            }
             gate(fs.realpathSync(expanded) === expanded && fs.lstatSync(expanded).isDirectory(), 'Expansion root aliases a different path');
             report.expanded_inventory = await inventory(expanded);
             writePublic('expanded-inventory.json', JSON.stringify(report.expanded_inventory, null, 2) + '\n');
