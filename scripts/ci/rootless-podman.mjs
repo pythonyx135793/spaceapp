@@ -9,6 +9,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 import { fileURLToPath } from "node:url";
 import { waitForTimedCommand } from "../../packages/run-spaceapp/src/command-timeout.mjs";
 import { composeCommand, composeProjectName, PROFILE_REQUIREMENTS, profileRuntimeSettings } from "../../packages/run-spaceapp/src/index.mjs";
+import { NATIVE_APT_KEYRING, nativeAptInputFacts, planOwnedNativeAptSources, readNativeAptInputs, validateNativeAptInputs } from "./native-apt-source.mjs";
 
 const MINUTE = 60_000, GIB = 1024 ** 3, HEADROOM = 512 * 1024 ** 2;
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -254,32 +255,51 @@ async function initialize() {
   requireThat(container.code === 1 && container.output === "none", "Nested container provisioning cannot replace the native Ubuntu runner");
   requireThat(Number((await statfs("/sys/fs/cgroup")).type) === 0x63677270, "The native cgroup filesystem is not cgroupv2");
   for (const unit of ["podman.service", "podman.socket"]) requireThat(await output("systemctl", ["--user", "show", unit, "--property=ActiveState", "--value"]) === "inactive", `Refusing pre-existing or uninspectable ${unit}`);
-  await artifact("source-pins.json", { sources: SOURCES, assets: ASSETS, nativeDependencies: NATIVE_DEPS, engine: "6.1.4", provider: "2.40.0", runnerImage: process.env.ImageVersion ?? null, runnerOS: osRelease, appArmorLimitation: "Upstream Podman6.1.4 rootless skips default per-container AppArmor and rejects explicit profiles; vendor executable namespace policy remains enabled. No per-container AppArmor confinement is claimed." });
+  await artifact("source-pins.json", { sources: SOURCES, assets: ASSETS, aptKeyring: NATIVE_APT_KEYRING, nativeDependencies: NATIVE_DEPS, engine: "6.1.4", provider: "2.40.0", runnerImage: process.env.ImageVersion ?? null, runnerOS: osRelease, appArmorLimitation: "Upstream Podman6.1.4 rootless skips default per-container AppArmor and rejects explicit profiles; vendor executable namespace policy remains enabled. No per-container AppArmor confinement is claimed." });
   await resources("before-build", state.build, 10 * GIB);
 }
 
 async function installDependencies() {
-  const sourcePath = "/etc/apt/sources.list.d/ubuntu.sources";
-  await regular(sourcePath, { owner: 0, max: 64 * 1024 });
-  const sources = await readFile(sourcePath, "utf8");
-  for (const stanza of sources.split("\n").filter((line) => !line.trim().startsWith("#")).join("\n").trim().split(/\n\s*\n/)) {
-    const fields = {}; let previous;
-    for (const line of stanza.split("\n")) {
-      if (/^\s/.test(line)) { requireThat(previous, "Malformed continued Ubuntu source field"); fields[previous] += ` ${line.trim()}`; continue; }
-      const match = line.match(/^([A-Za-z-]+):\s*(.*)$/);
-      requireThat(match && !Object.hasOwn(fields, match[1]), "Malformed or repeated Ubuntu source field"); previous = match[1]; fields[previous] = match[2];
-    }
-    requireThat(fields.Types?.split(/\s+/).every((value) => ["deb", "deb-src"].includes(value)), "Unreviewed Ubuntu source type");
-    requireThat(fields.URIs?.split(/\s+/).every((value) => { const url = new URL(value); return ["http:", "https:"].includes(url.protocol) && /^(?:(?:[a-z]{2}|azure)\.)?archive\.ubuntu\.com$|^security\.ubuntu\.com$/.test(url.hostname) && !url.username && !url.password; }), "Non-Ubuntu native dependency source");
-    requireThat(fields.Suites?.split(/\s+/).every((value) => ["noble", "noble-updates", "noble-security", "noble-backports"].includes(value)) && fields["Signed-By"] === "/usr/share/keyrings/ubuntu-archive-keyring.gpg" && !/^(?:Trusted|Allow-Insecure):\s*yes$/mi.test(stanza), "Unreviewed/unsigned native dependency repository");
-  }
-  await regular("/usr/share/keyrings/ubuntu-archive-keyring.gpg", { owner: 0 });
+  const inputs = await readNativeAptInputs();
+  // Retain safe observed facts even when policy rejects an input. Never log raw source text.
+  await artifact("native-apt-observed-inputs.json", nativeAptInputFacts(inputs));
+  validateNativeAptInputs(inputs);
   // _apt must traverse its own download area without making the runner HOME public.
   requireThat(await realpath("/var/tmp") === "/var/tmp" && (await lstat("/var/tmp")).uid === 0, "Unreviewed native apt scratch parent");
   state.aptRoot = await mkdtemp(join("/var/tmp", state.aptPrefix)); await chmod(state.aptRoot, 0o755);
+  const owned = await lstat(state.aptRoot);
+  requireThat(owned.isDirectory() && !owned.isSymbolicLink() && owned.uid === process.getuid() && !(owned.mode & 0o022) && await realpath(state.aptRoot) === state.aptRoot, "Untrusted owned native apt scratch");
   await mkdir(join(state.aptRoot, "lists"), { mode: 0o755 }); await mkdir(join(state.aptRoot, "archives"), { mode: 0o755 });
   const sourceDir = join(state.aptRoot, "sources"); await mkdir(sourceDir, { mode: 0o755 });
-  await writeFile(join(sourceDir, "ubuntu.sources"), sources, { mode: 0o644 });
+  const plan = planOwnedNativeAptSources(inputs, { root: state.aptRoot, prefix: state.aptPrefix });
+  const packagePath = join(state.aptRoot, NATIVE_APT_KEYRING.packageName);
+  requireThat(await absent(packagePath) && await absent(plan.keyringPath), "Owned Ubuntu keyring paths already exist");
+  await command("curl", ["--fail", "--silent", "--show-error", "--proto", "=https", "--tlsv1.2", "--connect-timeout", "10", "--max-time", "30", "--max-filesize", String(NATIVE_APT_KEYRING.packageBytes), "--output", packagePath, NATIVE_APT_KEYRING.url], { timeout: 35_000, label: "pinned official Ubuntu keyring package" });
+  const pkg = await regular(packagePath, { owner: process.getuid(), max: NATIVE_APT_KEYRING.packageBytes });
+  requireThat(pkg.size === NATIVE_APT_KEYRING.packageBytes && await hashFile(packagePath) === NATIVE_APT_KEYRING.packageSha256, "Official Ubuntu keyring package integrity failed");
+  await chmod(packagePath, 0o444);
+  const extraction = await command("python3", ["-I", "-B", join(ROOT, "scripts/ci/native-apt-keyring.py"), packagePath, plan.keyringPath], { timeout: 30_000, capture: true, allowFailure: true, label: "read only the pinned Ubuntu archive keyring" });
+  if (extraction.code !== 0) {
+    state.unconfirmed.push({ label: "pinned keyring extraction did not confirm owned decoder cleanup" });
+    throw new Failure(`Read-only pinned keyring extraction failed with exit ${extraction.code}`, extraction.code);
+  }
+  const keyringReceipt = JSON.parse(extraction.output);
+  const keyring = await regular(plan.keyringPath, { owner: process.getuid(), max: NATIVE_APT_KEYRING.keyringBytes });
+  const keyringHash = await hashFile(plan.keyringPath);
+  requireThat(keyring.size === NATIVE_APT_KEYRING.keyringBytes && (keyring.mode & 0o7777) === 0o444 && await realpath(plan.keyringPath) === plan.keyringPath && keyringHash === NATIVE_APT_KEYRING.keyringSha256, "Owned Ubuntu archive keyring could not be verified");
+  requireThat(keyringReceipt.packageBytes === NATIVE_APT_KEYRING.packageBytes && keyringReceipt.packageSha256 === NATIVE_APT_KEYRING.packageSha256 && keyringReceipt.keyringBytes === keyring.size && keyringReceipt.keyringSha256 === keyringHash && keyringReceipt.path === plan.keyringPath && keyringReceipt.hostKeyringUsed === false && keyringReceipt.packageInstalled === false && keyringReceipt.maintainerScriptsExecuted === false, "Pinned keyring extraction receipt differs from actual verified files");
+  const copies = [[plan.sourcePath, plan.sourceBytes, plan.copiedSourceSha256]];
+  if (plan.mirrorBytes) copies.push([plan.mirrorPath, plan.mirrorBytes, plan.copiedMirrorSha256]);
+  const receipts = [{ path: plan.keyringPath, bytes: keyring.size, sha256: keyringHash, mode: "444" }];
+  for (const [path, bytes, expectedSha256] of copies) {
+    await writeFile(path, bytes, { mode: 0o644, flag: "wx" });
+    const file = await regular(path, { owner: process.getuid(), max: bytes.length });
+    const actual = await readFile(path), hash = createHash("sha256").update(actual).digest("hex");
+    requireThat(file.size === bytes.length && !(file.mode & 0o022) && await realpath(path) === path && actual.equals(bytes) && hash === expectedSha256, "Owned native apt copy could not be verified");
+    receipts.push({ path, bytes: actual.length, sha256: hash });
+  }
+  for (const { path } of receipts) await command("sudo", ["-n", "-u", "_apt", "--", "/usr/bin/test", "-r", path], { label: "ordinary APT sandbox input traversal" });
+  await artifact("native-apt-owned-inputs.json", { sourceSha256: plan.sourceSha256, mirrorSha256: plan.mirrorSha256, keyringSha256: keyringHash, usesMirror: plan.usesMirror, hostKeyringUsed: false, keyringPackage: keyringReceipt, copies: receipts });
   state.apt = ["-o", "Dir::Etc::sourcelist=/dev/null", "-o", `Dir::Etc::sourceparts=${sourceDir}`, "-o", `Dir::State::lists=${join(state.aptRoot, "lists")}`, "-o", `Dir::Cache::archives=${join(state.aptRoot, "archives")}`, "-o", "Acquire::AllowInsecureRepositories=false", "-o", "APT::Get::AllowUnauthenticated=false"];
   const update = await command("sudo", ["-n", "apt-get", ...state.apt, "update"], { timeout: 5 * MINUTE, label: "signed Ubuntu dependency metadata" });
   requireThat(!/unsandboxed as root/i.test(update.stderr), "APT could not use its ordinary download sandbox");

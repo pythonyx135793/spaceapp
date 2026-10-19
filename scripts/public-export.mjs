@@ -79,6 +79,10 @@ export const publicRepositoryMaintainedFiles = new Set(["docs/security-model.md"
 
 const publicScripts = new Set([
   "scripts/ci/rootless-podman.mjs",
+  "scripts/ci/native-apt-source.mjs",
+  "scripts/ci/native-apt-source.test.mjs",
+  "scripts/ci/native-apt-keyring.py",
+  "scripts/ci/native-apt-keyring.test.py",
   // Loaded by apps/api/src/cli-render-proof-fixture.ts (proof rooms); missing, that path failed (review F18).
   "scripts/cli-render-fixture.mjs",
   // Maintained here; listed so the CI re-export of this repository keeps them.
