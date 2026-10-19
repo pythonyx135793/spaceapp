@@ -9,6 +9,8 @@ on:
       - "scripts/ci/rootless-podman.mjs"
       - "scripts/ci/native-apt-source.mjs"
       - "scripts/ci/native-apt-source.test.mjs"
+      - "scripts/ci/native-host-prereqs.mjs"
+      - "scripts/ci/native-host-prereqs.test.mjs"
       - "scripts/ci/native-apt-keyring.py"
       - "scripts/ci/native-apt-keyring.test.py"
       - "scripts/public-export.mjs"
@@ -79,10 +81,10 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "22.23.0"
-      - name: Verify native APT source parsing and owned-copy controls
+      - name: Verify native source and host prerequisite controls
         timeout-minutes: 1
         run: |
-          node --test scripts/ci/native-apt-source.test.mjs
+          node --test scripts/ci/native-apt-source.test.mjs scripts/ci/native-host-prereqs.test.mjs
           python3 -I -B scripts/ci/native-apt-keyring.test.py
       - name: Bootstrap native Podman and verify the real small lifecycle
         id: podman-proof

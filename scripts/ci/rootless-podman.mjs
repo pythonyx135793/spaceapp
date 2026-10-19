@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import { waitForTimedCommand } from "../../packages/run-spaceapp/src/command-timeout.mjs";
 import { composeCommand, composeProjectName, PROFILE_REQUIREMENTS, profileRuntimeSettings } from "../../packages/run-spaceapp/src/index.mjs";
 import { NATIVE_APT_KEYRING, nativeAptInputFacts, planOwnedNativeAptSources, readNativeAptInputs, validateNativeAptInputs } from "./native-apt-source.mjs";
+import { analyzeSubordinateRanges, NATIVE_EXECUTABLES, nativePolicyObservation, nativeRuntimeConfig, trustedNativeFile, validateNativeDestinations, validateNativeMappings, validateNativePolicies, validateNativeSessionAndStorage } from "./native-host-prereqs.mjs";
 
 const MINUTE = 60_000, GIB = 1024 ** 3, HEADROOM = 512 * 1024 ** 2;
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -235,13 +236,15 @@ async function initialize() {
   await mkdir(state.build, { mode: 0o755 }); await mkdir(join(state.build, "src"), { mode: 0o755 }); await mkdir(state.provider, { mode: 0o700 });
   state.project = composeProjectName(state.home);
   state.runtimeDir = process.env.XDG_RUNTIME_DIR;
-  requireThat(await realpath(process.env.HOME) === process.env.HOME && (await lstat(process.env.HOME)).uid === process.getuid(), "The normal runner HOME must remain unchanged and owned by this UID");
-  requireThat(state.runtimeDir === `/run/user/${process.getuid()}` && (await lstat(join(state.runtimeDir, "bus"))).isSocket(), "A real existing systemd user session is required");
-  requireThat(await absent(join(process.env.HOME, ".local/share/containers/storage")), "Refusing pre-existing rootless storage");
   const allowed = ["HOME", "USER", "LOGNAME", "PATH", "LANG", "LC_ALL", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "TERM", "RUSTUP_HOME"];
   state.env = Object.fromEntries(allowed.filter((name) => process.env[name] !== undefined).map((name) => [name, process.env[name]]));
   const goBin = join(process.env.RUNNER_TOOL_CACHE ?? "", "go/1.26.9/x64/bin");
   state.env = { ...state.env, PATH: `${state.provider}:${goBin}:${state.env.PATH}`, CI: "true", GOTOOLCHAIN: "local", GOMAXPROCS: "2", GOCACHE: join(state.build, "go-cache"), GOPATH: join(state.build, "go"), GOPROXY: "off", CARGO_HOME: join(state.build, "cargo-home"), CARGO_BUILD_JOBS: "2", RUSTUP_TOOLCHAIN: "stable", RUSTUP_AUTO_INSTALL: "0", CC: "gcc-13", CXX: "g++-13", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_TERMINAL_PROMPT: "0", GIT_ASKPASS: "/bin/false", SPACEAPP_HOME: state.home, PODMAN_COMPOSE_PROVIDER: "docker-compose" };
+  const initialErrors = [], initialSession = await collectNativeSession(initialErrors);
+  await artifact("native-initial-session-prerequisites.json", { session: initialSession, errors: initialErrors });
+  if (initialErrors.length) throw new Failure("Initial native session observations are incomplete; safe facts retained", initialErrors[0].exitCode);
+  validateNativeSessionAndStorage(initialSession, process.getuid(), REQUIRED, HEADROOM);
+
   const tools = { go: await output("go", ["version"]) };
   await artifact("existing-toolchain.json", tools);
   requireThat(tools.go.split(/\s+/)[2] === "go1.26.9", "Pinned existing Go1.26.9 is unavailable");
@@ -254,7 +257,6 @@ async function initialize() {
   const container = await command("systemd-detect-virt", ["--container"], { capture: true, allowFailure: true });
   requireThat(container.code === 1 && container.output === "none", "Nested container provisioning cannot replace the native Ubuntu runner");
   requireThat(Number((await statfs("/sys/fs/cgroup")).type) === 0x63677270, "The native cgroup filesystem is not cgroupv2");
-  for (const unit of ["podman.service", "podman.socket"]) requireThat(await output("systemctl", ["--user", "show", unit, "--property=ActiveState", "--value"]) === "inactive", `Refusing pre-existing or uninspectable ${unit}`);
   await artifact("source-pins.json", { sources: SOURCES, assets: ASSETS, aptKeyring: NATIVE_APT_KEYRING, nativeDependencies: NATIVE_DEPS, engine: "6.1.4", provider: "2.40.0", runnerImage: process.env.ImageVersion ?? null, runnerOS: osRelease, appArmorLimitation: "Upstream Podman6.1.4 rootless skips default per-container AppArmor and rejects explicit profiles; vendor executable namespace policy remains enabled. No per-container AppArmor confinement is claimed." });
   await resources("before-build", state.build, 10 * GIB);
 }
@@ -311,43 +313,149 @@ async function installDependencies() {
   await artifact("native-package-origins.txt", await output("apt-cache", [...state.apt, "policy", ...NATIVE_DEPS]));
 }
 
-async function vendorPolicy(stage) {
-  requireThat((await readFile("/sys/module/apparmor/parameters/enabled", "utf8")).trim() === "Y", "AppArmor is disabled");
-  requireThat((await readFile("/proc/sys/kernel/apparmor_restrict_unprivileged_userns", "utf8")).trim() === "1", "Unreviewed Ubuntu user-namespace restriction state");
-  const registered = await output("dpkg-query", ["-W", "-f=${Conffiles}", "apparmor"]);
-  const loaded = JSON.parse(await output("sudo", ["-n", "aa-status", "--json"]));
-  const facts = {};
-  for (const name of ["podman", "runc"]) {
-    const path = `/etc/apparmor.d/${name}`;
-    await regular(path, { owner: 0, max: 256 * 1024 });
-    const entry = registered.split("\n").map((line) => line.trim().split(/\s+/)).find((fields) => fields[0] === path);
-    requireThat(entry && /^[a-f0-9]{32}$/.test(entry[1]) && await hashFile(path, "md5") === entry[1], `Vendor ${name} policy differs from the installed signed package`);
-    const expanded = await output("sudo", ["-n", "apparmor_parser", "--preprocess", path]);
-    requireThat(new RegExp(`(?:profile\\s+${name}\\s+)?/usr/bin/${name}(?:\\s|\\()`).test(expanded) && /\buserns\s*,/.test(expanded), `Vendor ${name} profile has no reviewed executable/userns attachment`);
-    const profile = Object.entries(loaded.profiles ?? {}).find(([profileName]) => profileName === name || profileName === `/usr/bin/${name}`);
-    requireThat(profile && ["enforce", "unconfined"].includes(profile[1]), `Vendor ${name} profile is missing or in complain mode`);
-    facts[name] = { sha256: await hashFile(path), profile: profile[0], mode: profile[1], executable: `/usr/bin/${name}` };
-  }
-  await artifact(`apparmor-${stage}.json`, { enabled: true, restrictedUserNamespaces: true, profiles: facts, perContainerLimitation: "Rootless Podman skips the default per-container AppArmor profile upstream; actual labels are recorded separately." });
-  state.vendorProfiles = facts;
+async function nativeSnapshot(path, max = 256 * 1024) {
+  let file;
+  try { file = await lstat(path); } catch (error) { if (error.code === "ENOENT") return { exists: false }; throw error; }
+  let canonical = null;
+  try { canonical = await realpath(path); } catch { /* Broken links remain observed, never trusted. */ }
+  const facts = { exists: true, type: file.isSymbolicLink() ? "symlink" : file.isFile() ? "regular" : file.isDirectory() ? "directory" : file.isSocket() ? "socket" : "other", canonical, uid: file.uid, gid: file.gid, mode: file.mode & 0o7777, bytes: file.size, device: file.dev, inode: file.ino, mtimeMs: file.mtimeMs };
+  if (trustedNativeFile(facts, path, 0, max)) facts.sha256 = await hashFile(path);
+  return facts;
 }
 
-async function validateSubids() {
-  const identity = new Set([String(process.getuid()), userInfo().username]); state.subids = {};
-  for (const kind of ["uid", "gid"]) {
-    const records = (await readFile(`/etc/sub${kind}`, "utf8")).split("\n").filter((line) => line.trim() && !line.trim().startsWith("#")).map((line) => {
-      const [name, start, count, ...extra] = line.split(":"); const a = Number(start), n = Number(count);
-      requireThat(!extra.length && Number.isSafeInteger(a) && a > 0 && Number.isSafeInteger(n) && n > 0 && a + n <= 2 ** 32 - 1, "Malformed subordinate mapping"); return { name, start: a, end: a + n };
-    });
-    const own = records.filter((record) => identity.has(record.name));
-    requireThat(own.reduce((n, record) => n + record.end - record.start, 0) >= 65536, `Insufficient existing subordinate ${kind} range`);
-    for (const record of own) requireThat(records.filter((other) => record.start < other.end && other.start < record.end).length === 1, "Overlapping subordinate ID allocation");
-    const path = `/usr/bin/new${kind}map`, file = await regular(path, { owner: 0 });
-    const capabilities = await output("getcap", [path]);
-    requireThat(Boolean(file.mode & 0o4000) || new RegExp(`cap_set${kind}[^\\n]*[+=]ep`).test(capabilities), `Mapping helper has no normal setuid/file capability: ${path}`);
-    state.subids[kind] = own.map(({ start, end }) => ({ start, count: end - start }));
+async function observeNative(errors, field, operation) {
+  try { return await operation(); } catch (error) {
+    const code = /^[A-Z0-9_]{1,40}$/.test(error.code ?? "") ? error.code : Number.isInteger(error.exitCode) ? `EXIT_${error.exitCode}` : "OBSERVATION_FAILED";
+    const exitCode = Number.isInteger(error.exitCode) && error.exitCode > 0 ? error.exitCode : 1;
+    errors.push({ field, code, exitCode }); return { observationFailed: true, code, exitCode };
   }
-  await artifact("subordinate-mappings.json", state.subids);
+}
+
+async function collectVendorPolicies(errors) {
+  const observe = (field, operation) => observeNative(errors, field, operation);
+  const facts = { profiles: {} };
+  facts.apparmorEnabled = await observe("apparmorEnabled", async () => (await readFile("/sys/module/apparmor/parameters/enabled", "utf8")).trim());
+  facts.restrictedUserns = await observe("restrictedUserns", async () => (await readFile("/proc/sys/kernel/apparmor_restrict_unprivileged_userns", "utf8")).trim());
+  facts.packageVersion = await observe("apparmorPackageVersion", () => output("dpkg-query", ["-W", "-f=${Version}", "apparmor"], { timeout: 10_000 }));
+  const registered = await observe("registeredVendorPolicies", () => output("dpkg-query", ["-W", "-f=${Conffiles}", "apparmor"], { timeout: 10_000 }));
+  const loaded = await observe("loadedVendorPolicies", async () => JSON.parse(await output("sudo", ["-n", "aa-status", "--json"], { timeout: 10_000 })));
+  for (const [name, spec] of Object.entries(NATIVE_EXECUTABLES)) {
+      const file = await observe(`policy-${name}-metadata`, () => nativeSnapshot(spec.policy));
+      const local = await observe(`policy-${name}-local-include-metadata`, () => nativeSnapshot(`/etc/apparmor.d/local/${name}`));
+      const entry = typeof registered === "string" ? registered.split("\n").map((line) => line.trim().split(/\s+/)).find((fields) => fields[0] === spec.policy) : undefined;
+      const raw = trustedNativeFile(file, spec.policy) ? await observe(`policy-${name}-source`, () => readFile(spec.policy, "utf8")) : undefined;
+      const sourceKnown = file.sha256 === spec.sha256 && entry?.[1] === spec.md5;
+      const localKnown = local.exists === false || trustedNativeFile(local, `/etc/apparmor.d/local/${name}`) && local.bytes === 0;
+      let expanded, names;
+      if (sourceKnown && localKnown) {
+        expanded = await observe(`policy-${name}-preprocess`, () => output("sudo", ["-n", "apparmor_parser", "--preprocess", spec.policy], { timeout: 10_000 }));
+        names = await observe(`policy-${name}-parsed-names`, () => output("sudo", ["-n", "apparmor_parser", "--names", spec.policy], { timeout: 10_000 }));
+      }
+      const modes = loaded?.profiles ?? {};
+      facts.profiles[name] = nativePolicyObservation(spec, file, raw, expanded, names, entry?.[1], modes[name] ?? modes[spec.path], local);
+  }
+  return facts;
+}
+
+async function nativeDestination(name, errors) {
+  const spec = NATIVE_EXECUTABLES[name];
+  const file = await observeNative(errors, `destination-${name}-file`, () => nativeSnapshot(spec.path, 128 * 1024 * 1024));
+  const parent = await observeNative(errors, `destination-${name}-parent`, () => nativeSnapshot(dirname(spec.path)));
+  let packageOwner = null, unreviewedPackageOwnerSha256 = null;
+  if (file.exists) {
+    const found = await observeNative(errors, `destination-${name}-package`, async () => {
+      const value = await command("dpkg-query", ["-S", "--", spec.path], { capture: true, allowFailure: true, timeout: 10_000 });
+      if (![0, 1].includes(value.code)) throw new Failure("Native destination package ownership could not be inspected", value.code);
+      return value;
+    });
+    if (found.code === 0) {
+      const lines = found.output.split("\n").filter(Boolean);
+      const prefix = lines.length === 1 && lines[0].endsWith(`: ${spec.path}`) ? lines[0].slice(0, -spec.path.length - 2).replace(/:amd64$/, "") : "";
+      if (["podman", "runc", "containerd.io"].includes(prefix)) packageOwner = prefix;
+      else unreviewedPackageOwnerSha256 = createHash("sha256").update(found.output).digest("hex");
+    }
+  }
+  return { path: spec.path, file, parent, packageOwner, unreviewedPackageOwnerSha256 };
+}
+
+async function assertNativeDestinationPreimage(name) {
+  const errors = [], current = await nativeDestination(name, errors);
+  await artifact(`native-${name}-destination-before-replacement.json`, { ...current, errors });
+  if (errors.length) throw new Failure("Native destination preimage inspection failed; safe facts retained", errors[0].exitCode);
+  validateNativeDestinations({ ...state.destinationPreimages, [name]: current });
+  requireThat(JSON.stringify(current.file) === JSON.stringify(state.destinationPreimages[name].file) && current.packageOwner === state.destinationPreimages[name].packageOwner, `Native ${name} destination changed since its reviewed preflight`);
+}
+
+async function collectNativeMappings(errors) {
+  const facts = {};
+  for (const kind of ["uid", "gid"]) {
+    const path = `/etc/sub${kind}`;
+    const source = await observeNative(errors, `mapping-${kind}-source-metadata`, () => nativeSnapshot(path));
+    const helper = await observeNative(errors, `mapping-${kind}-helper-metadata`, () => nativeSnapshot(`/usr/bin/new${kind}map`, 1024 * 1024));
+    const text = trustedNativeFile(source, path) ? await observeNative(errors, `mapping-${kind}-source`, () => readFile(path, "utf8")) : undefined;
+    const caps = await observeNative(errors, `mapping-${kind}-capability`, () => output("getcap", [`/usr/bin/new${kind}map`], { timeout: 10_000 }));
+    facts[kind] = { source, helper, ranges: typeof text === "string" ? analyzeSubordinateRanges(text, process.getuid(), userInfo().username) : null,
+      capabilityEffective: typeof caps === "string" && new RegExp(`(?:^|\\s)cap_set${kind}(?:,[a-z_]+)*[+=]ep(?:\\s|$)`).test(caps) };
+  }
+  return facts;
+}
+
+async function collectNativeSession(errors) {
+  const facts = {}, observe = (name, operation) => observeNative(errors, name, operation);
+  facts.runtimePath = state.runtimeDir;
+  facts.busSocket = await observe("userBus", async () => (await lstat(join(state.runtimeDir, "bus"))).isSocket());
+  facts.homeOwned = await observe("ownedNormalHome", async () => await realpath(process.env.HOME) === process.env.HOME && (await lstat(process.env.HOME)).uid === process.getuid());
+  for (const [key, unit] of [["userService", "podman.service"], ["userSocket", "podman.socket"]]) facts[key] = await observe(key, () => output("systemctl", ["--user", "show", unit, "--property=ActiveState", "--value"], { timeout: 10_000 }));
+  facts.userConfigAbsent = await observe("userConfigAbsent", () => absent(join(process.env.HOME, ".config/containers/containers.conf")));
+  facts.userUnitsAbsent = await observe("userUnitsAbsent", async () => await absent(join(process.env.HOME, ".config/systemd/user/podman.service")) && await absent(join(process.env.HOME, ".config/systemd/user/podman.socket")));
+  facts.delegation = await observe("userManagerDelegation", async () => {
+    const unit = `user@${process.getuid()}.service`;
+    const pidValue = await observe("userManagerPid", () => output("systemctl", ["show", unit, "--property=MainPID", "--value"], { timeout: 10_000 }));
+    const pid = typeof pidValue === "string" && /^\d+$/.test(pidValue) && Number(pidValue) > 1 ? Number(pidValue) : null;
+    const controlGroup = await observe("userManagerCgroup", () => output("systemctl", ["show", unit, "--property=ControlGroup", "--value"], { timeout: 10_000 }));
+    const delegate = await observe("userManagerDelegate", () => output("systemctl", ["show", unit, "--property=Delegate", "--value"], { timeout: 10_000 }));
+    const root = typeof controlGroup === "string" && controlGroup.startsWith("/") && !controlGroup.split("/").includes("..") ? resolve("/sys/fs/cgroup", `.${controlGroup}`) : null;
+    const controllers = root && within("/sys/fs/cgroup", root) ? await observe("userManagerControllers", async () => (await readFile(join(root, "cgroup.controllers"), "utf8")).trim().split(/\s+/)) : null;
+    const subtreeControllers = root && within("/sys/fs/cgroup", root) ? await observe("userManagerSubtreeControllers", async () => (await readFile(join(root, "cgroup.subtree_control"), "utf8")).trim().split(/\s+/).filter(Boolean)) : null;
+    const before = pid ? await observe("userManagerStartBefore", () => readFile(`/proc/${pid}/stat`, "utf8")) : null;
+    const identity = pid ? await observe("userManagerOwnership", async () => statusFields(await readFile(`/proc/${pid}/status`, "utf8"))) : null;
+    const capacity = pid ? await observe("userManagerCapacity", () => cgroupCapacity(pid)) : null;
+    const after = pid ? await observe("userManagerStartAfter", () => readFile(`/proc/${pid}/stat`, "utf8")) : null;
+    const currentPidValue = await observe("userManagerPidAfter", () => output("systemctl", ["show", unit, "--property=MainPID", "--value"], { timeout: 10_000 }));
+    const currentPid = typeof currentPidValue === "string" ? Number(currentPidValue) : null;
+    const start = (text) => typeof text === "string" ? text.slice(text.lastIndexOf(")") + 2).split(/\s+/)[19] : null;
+    return { pid, controlGroup, delegate, controllers, subtreeControllers, capacity,
+      ownedPid: identity?.Uid?.split(/\s+/).every((id) => Number(id) === process.getuid()) === true,
+      identityStable: /^\d+$/.test(start(before)) && start(before) === start(after) && pid === currentPid };
+  });
+  facts.storage = await observe("nativeStorageParent", async () => {
+    const fs = await statfs(process.env.HOME);
+    return { fresh: await absent(join(process.env.HOME, ".local/share/containers/storage")), filesystemType: Number(fs.type), freeBytes: Number(fs.bavail) * Number(fs.bsize), freeInodes: Number(fs.ffree) };
+  });
+  return facts;
+}
+
+async function nativeHostPrerequisites() {
+  const facts = { schemaVersion: 1, errors: [], note: "Observed availability/delegation is not application limit enforcement; the production probe is unchanged." };
+  facts.policies = await collectVendorPolicies(facts.errors);
+  facts.destinations = {};
+  for (const name of Object.keys(NATIVE_EXECUTABLES)) facts.destinations[name] = await observeNative(facts.errors, `destination-${name}`, () => nativeDestination(name, facts.errors));
+  facts.mappings = await collectNativeMappings(facts.errors);
+  facts.session = await collectNativeSession(facts.errors);
+  await artifact("native-host-prerequisites-before-build.json", facts);
+  if (facts.errors.length) throw new Failure("Native prerequisite observations are incomplete; all safe facts were retained before validation", facts.errors[0].exitCode);
+  validateNativePolicies(facts.policies); validateNativeDestinations(facts.destinations);
+  validateNativeMappings(facts.mappings); validateNativeSessionAndStorage(facts.session, process.getuid(), REQUIRED, HEADROOM);
+  state.vendorProfiles = Object.fromEntries(Object.entries(NATIVE_EXECUTABLES).map(([name, spec]) => [name, { profile: spec.name, executable: spec.path, mode: facts.policies.profiles[name].loadedMode }]));
+  state.destinationPreimages = facts.destinations;
+  state.subids = Object.fromEntries(["uid", "gid"].map((kind) => [kind, facts.mappings[kind].ranges.ownRanges]));
+}
+
+async function vendorPolicy(stage) {
+  const errors = [], facts = await collectVendorPolicies(errors);
+  await artifact(`apparmor-${stage}.json`, { ...facts, errors, perContainerLimitation: "Rootless Podman skips the default per-container AppArmor profile upstream; actual labels are recorded separately." });
+  if (errors.length) throw new Failure("Native policy observations are incomplete; safe facts retained", errors[0].exitCode);
+  validateNativePolicies(facts);
 }
 
 async function sourceMetadata(name, path, stage) {
@@ -385,7 +493,10 @@ async function buildNative() {
       const tags = new Set((info.split("\n").find((line) => line.includes("-tags="))?.split("-tags=")[1] ?? "").trim().replace(/^"|"$/g, "").split(/[,\s]+/));
       requireThat(info.includes("CGO_ENABLED=1") && ["apparmor", "seccomp", "systemd"].every((tagName) => tags.has(tagName)) && !tags.has("remote"), "Native Podman security/build tags are incomplete");
       await artifact("podman-build-info.txt", info);
-      for (const [file, destination] of [["bin/podman", "/usr/bin/podman"], ["bin/rootlessport", "/usr/libexec/podman/rootlessport"]]) await command("sudo", ["-n", "install", "-D", "-m0755", file, destination], { cwd: path });
+      for (const [file, destination] of [["bin/podman", NATIVE_EXECUTABLES.podman.path], ["bin/rootlessport", "/usr/libexec/podman/rootlessport"]]) {
+        if (file === "bin/podman") await assertNativeDestinationPreimage("podman");
+        await command("sudo", ["-n", "install", "-D", "-m0755", file, destination], { cwd: path });
+      }
     }
     await sourceMetadata(name, path, "after");
     await command("git", ["diff", "--exit-code", "--"], { cwd: path, capture: true, label: `${name} tracked source/lock integrity` });
@@ -395,7 +506,10 @@ async function buildNative() {
     await command("curl", ["--fail", "--location", "--proto", "=https", "--tlsv1.2", "--connect-timeout", "20", "--max-time", "180", "--output", path, url], { timeout: 185_000, label: `official ${name} asset` });
     requireThat((await regular(path, { owner: process.getuid() })).size === bytes && await hashFile(path) === sha256, `Official ${name} asset integrity failed`);
     await chmod(path, 0o700);
-    if (name === "runc") await command("sudo", ["-n", "install", "-m0755", path, "/usr/bin/runc"]);
+    if (name === "runc") {
+      await assertNativeDestinationPreimage("runc");
+      await command("sudo", ["-n", "install", "-m0755", path, NATIVE_EXECUTABLES.runc.path]);
+    }
   }
 }
 
@@ -404,16 +518,16 @@ async function prepareEngine() {
   state.userUnits = join(process.env.HOME, ".config/systemd/user");
   for (const path of [state.userConfig, join(state.userUnits, "podman.service"), join(state.userUnits, "podman.socket")]) requireThat(await absent(path), "Refusing existing user Podman configuration/unit");
   await mkdir(dirname(state.userConfig), { recursive: true }); await mkdir(state.userUnits, { recursive: true });
-  await writeFile(state.userConfig, '[engine]\ncgroup_manager = "systemd"\nruntime = "runc"\nconmon_path = ["/usr/libexec/podman/conmon"]\nhelper_binaries_dir = ["/usr/libexec/podman", "/usr/lib/podman"]\n[engine.runtimes]\nrunc = ["/usr/bin/runc"]\n[network]\nnetwork_backend = "netavark"\n', { mode: 0o600, flag: "wx" });
+  await writeFile(state.userConfig, nativeRuntimeConfig(), { mode: 0o600, flag: "wx" });
   state.createdUserFiles.set(state.userConfig, await hashFile(state.userConfig));
   const source = join(state.build, "src/podman/contrib/systemd/user");
-  await writeFile(join(state.userUnits, "podman.service"), (await readFile(join(source, "podman.service.in"), "utf8")).replaceAll("@@PODMAN@@", "/usr/bin/podman"), { mode: 0o600, flag: "wx" });
+  await writeFile(join(state.userUnits, "podman.service"), (await readFile(join(source, "podman.service.in"), "utf8")).replaceAll("@@PODMAN@@", NATIVE_EXECUTABLES.podman.path), { mode: 0o600, flag: "wx" });
   state.createdUserFiles.set(join(state.userUnits, "podman.service"), await hashFile(join(state.userUnits, "podman.service")));
   await copyFile(join(source, "podman.socket"), join(state.userUnits, "podman.socket"), constants.COPYFILE_EXCL);
   state.createdUserFiles.set(join(state.userUnits, "podman.socket"), await hashFile(join(state.userUnits, "podman.socket"))); state.unitsCreated = true;
   await command("systemctl", ["--user", "daemon-reload"]); await command("systemctl", ["--user", "start", "podman.socket"]);
   const versions = {};
-  for (const [path, expected] of [["/usr/bin/podman", "6.1.4"], ["/usr/bin/runc", "1.5.2"], [join(state.provider, "docker-compose"), "2.40.0"], ["/usr/libexec/podman/conmon", "2.2.1"], ["/usr/libexec/podman/netavark", "2.1.0"], ["/usr/libexec/podman/aardvark-dns", "2.1.0"], ["/usr/bin/pasta", "2026_10_02.cba3570"]]) {
+  for (const [path, expected] of [[NATIVE_EXECUTABLES.podman.path, "6.1.4"], [NATIVE_EXECUTABLES.runc.path, "1.5.2"], [join(state.provider, "docker-compose"), "2.40.0"], ["/usr/libexec/podman/conmon", "2.2.1"], ["/usr/libexec/podman/netavark", "2.1.0"], ["/usr/libexec/podman/aardvark-dns", "2.1.0"], ["/usr/bin/pasta", "2026_10_02.cba3570"]]) {
     const text = await output(path, path.endsWith("docker-compose") ? ["version", "--short"] : ["--version"]);
     requireThat(new RegExp(`(?:^|[^0-9])v?${expected.replaceAll(".", "\\.")}(?:$|[^0-9])`).test(text), `Wrong native component version: ${path}`);
     const installed = await realpath(path);
@@ -453,7 +567,7 @@ async function engineIdentity() {
   const key = (info) => ({ version: info.version?.Version, commit: info.version?.GitCommit, rootless: info.host?.security?.rootless, cgroupVersion: info.host?.cgroupVersion, cgroupManager: info.host?.cgroupManager, graphRoot: info.store?.graphRoot, runRoot: info.store?.runRoot, runtime: info.host?.ociRuntime?.path });
   const expected = key(local);
   await artifact("cli-api-observed.json", { local: expected, api: key(remote), localControllers: local.host?.cgroupControllers, apiControllers: remote.host?.cgroupControllers, localSecurity: local.host?.security, apiSecurity: remote.host?.security });
-  requireThat(JSON.stringify(expected) === JSON.stringify(key(remote)) && expected.version === "6.1.4" && expected.commit === SOURCES.at(-1)[2] && expected.rootless === true && expected.runtime === "/usr/bin/runc" && expected.cgroupVersion === "v2" && expected.cgroupManager === "systemd", "Native CLI/API version, rootless store or selected OCI runtime differs");
+  requireThat(JSON.stringify(expected) === JSON.stringify(key(remote)) && expected.version === "6.1.4" && expected.commit === SOURCES.at(-1)[2] && expected.rootless === true && expected.runtime === NATIVE_EXECUTABLES.runc.path && expected.cgroupVersion === "v2" && expected.cgroupManager === "systemd", "Native CLI/API version, rootless store or selected OCI runtime differs");
   const controllers = local.host.cgroupControllers;
   requireThat(Array.isArray(controllers) && ["cpu", "memory"].every((name) => controllers.includes(name)), "Actual CPU/memory controllers are not delegated");
   requireThat(local.host.security.seccompEnabled === true && local.host.security.apparmorEnabled === true && local.host.cpus >= REQUIRED.cpuCount && local.host.memTotal >= REQUIRED.memoryBytes, "Actual engine security/resource prerequisites failed");
@@ -463,7 +577,7 @@ async function engineIdentity() {
   const options = JSON.stringify(local.store.graphOptions ?? {});
   requireThat(!/ignore_chown_errors[^,}\]]*(?:true|[=:]1)/i.test(options) && !/mount_program/i.test(options), "Unreviewed overlay ownership or external mount-program override");
   const pid = Number(await output("systemctl", ["--user", "show", "podman.service", "--property=MainPID", "--value"]));
-  requireThat(Number.isSafeInteger(pid) && pid > 1 && await realpath(`/proc/${pid}/exe`) === "/usr/bin/podman", "Rootless API is not the installed native engine process");
+  requireThat(Number.isSafeInteger(pid) && pid > 1 && await realpath(`/proc/${pid}/exe`) === NATIVE_EXECUTABLES.podman.path, "Rootless API is not the installed native engine process");
   const startTime = (text) => text.slice(text.lastIndexOf(")") + 2).split(/\s+/)[19];
   const before = startTime(await readFile(`/proc/${pid}/stat`, "utf8")), fields = statusFields(await readFile(`/proc/${pid}/status`, "utf8"));
   const label = (await readFile(`/proc/${pid}/attr/current`, "utf8")).trim();
@@ -672,7 +786,7 @@ async function main() {
   state.deadline = deadline;
   try {
     await initialize(); state.homeParent = dirname(state.home);
-    await installDependencies(); await vendorPolicy("before-build"); await validateSubids();
+    await installDependencies(); await nativeHostPrerequisites();
     await buildNative(); await vendorPolicy("after-build"); await prepareEngine(); await removeBuildScratch(); await removeAptScratch();
     await acceptance();
   } catch (error) {

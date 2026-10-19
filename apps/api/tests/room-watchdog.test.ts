@@ -231,13 +231,16 @@ describe("Room Watchdog and Anti-Freeze Protection", () => {
     resolveLock();
     await wedgedPromise;
 
-    // Also test recording room event directly in store
-    const watchdogEvent: Event = {
-      id: "event:watchdog-test",
+    // Also test recording room event directly in store. Keep this input aligned
+    // with recordRoomEvent's generated id/time contract.
+    const latestBeforeWatchdog = store.getLatestEvent(room.id);
+    expect(latestBeforeWatchdog).not.toBeNull();
+    if (!latestBeforeWatchdog) throw new Error("Expected the room to have a prior event.");
+
+    const watchdogEvent = {
       roomId: room.id,
       paneId: pane.id,
       turnId: null,
-      workflowId: null,
       traceId: "trace:watchdog",
       type: "ROOM_WATCHDOG_ALERT",
       message: "Room watchdog auto-killed hanging process in pane 'Gemini CLI' to prevent room freeze.",
@@ -249,11 +252,21 @@ describe("Room Watchdog and Anti-Freeze Protection", () => {
         runtimeId: "cli:gemini",
         durationMs: 8000,
         killedAt: new Date().toISOString()
-      },
-      createdAt: new Date().toISOString()
-    };
+      }
+    } satisfies Omit<Event, "id" | "createdAt" | "workflowId">;
 
-    const recorded = await store.recordRoomEvent(watchdogEvent);
+    // Advance the fake clock by at least one millisecond after prior events,
+    // so this assertion tests chronological order deterministically.
+    const watchdogTime = Math.max(Date.now(), Date.parse(latestBeforeWatchdog.createdAt) + 1);
+    const recorded = await (async () => {
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(watchdogTime);
+        return await store.recordRoomEvent(watchdogEvent);
+      } finally {
+        vi.useRealTimers();
+      }
+    })();
     expect(recorded.type).toBe("ROOM_WATCHDOG_ALERT");
     expect(store.getLatestEvent(room.id)?.type).toBe("ROOM_WATCHDOG_ALERT");
   });
