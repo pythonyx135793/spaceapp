@@ -66,7 +66,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
-      SPACEAPP_HOME: ${{ runner.temp }}/spaceapp-podman-${{ github.run_id }}-${{ github.run_attempt }}
       PODMAN_COMPOSE_PROVIDER: docker-compose
       SPACEAPP_CI_REPOSITORY_VISIBILITY: ${{ github.event.repository.private == false && 'public' || 'private' }}
     steps:
@@ -80,6 +79,8 @@ jobs:
         id: podman-proof
         timeout-minutes: 58
         shell: bash
+        env:
+          SPACEAPP_HOME: ${{ runner.temp }}/spaceapp-podman-${{ github.run_id }}-${{ github.run_attempt }}
         run: node scripts/ci/rootless-podman.mjs
       - name: Preserve sanitized Podman terminal evidence
         if: always() && steps.podman-proof.outputs.sanitized == 'true'
