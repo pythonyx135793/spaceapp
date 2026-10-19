@@ -1,0 +1,172 @@
+name: Issue63 exact-source quality validation
+
+on:
+  push:
+    branches:
+      - codex/spaceapp63-source-quality-cp395-r85-c17
+    paths:
+      - .github/workflows/spaceapp63-source-quality.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: issue63-source-quality-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  source-quality:
+    if: >-
+      ${{ github.repository == 'pythonyx135793/spaceapp' &&
+          github.event.repository.private == false &&
+          github.event_name == 'push' &&
+          github.ref == 'refs/heads/codex/spaceapp63-source-quality-cp395-r85-c17' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      SOURCE_SHA: 562203048cf075fe36e47f87f9368034f7f73507
+      SOURCE_TREE: 0a8bd6f08892eb335faaa3c0f6a67f25353f4630
+      ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+      CI: "true"
+    defaults:
+      run:
+        shell: bash
+        working-directory: candidate
+    steps:
+      - name: Check out the exact reviewed implementation
+        id: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: pythonyx135793/spaceapp
+          ref: 562203048cf075fe36e47f87f9368034f7f73507
+          path: candidate
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Select the supported Node22 runtime
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22.23.0"
+
+      - name: Verify source identity and prepare bounded command receipts
+        id: prepare
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$GITHUB_REPOSITORY" = pythonyx135793/spaceapp
+          test "$RUNNER_OS" = Linux
+          test "$RUNNER_ARCH" = X64
+          test "$GITHUB_EVENT_NAME" = push
+          test "$(realpath .)" = "$GITHUB_WORKSPACE/candidate"
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$SOURCE_TREE"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          test "$(node --version)" = v22.23.0
+          test "$(nproc)" -ge 4
+          for executable in python3 make g++ timeout tee sha256sum; do command -v "$executable"; done
+          log_root="$RUNNER_TEMP/spaceapp63-source-quality-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir --mode=700 -- "$log_root"
+          printf 'QUALITY_LOG_DIR=%s\n' "$log_root" >> "$GITHUB_ENV"
+          printf 'QUALITY_GATE_PATH=%s/run-gate.sh\n' "$log_root" >> "$GITHUB_ENV"
+          cat > "$log_root/run-gate.sh" <<'GATE'
+          #!/usr/bin/env bash
+          set -uo pipefail
+          stage="$1"; shift
+          case "$stage:$*" in
+            'install:npm ci'|'check:npm run check'|'test:npm test'|'build:npm run build'|'hygiene:npm run hygiene:preflight') ;;
+            *) echo 'Unreviewed quality command' >&2; exit 2 ;;
+          esac
+          set +e
+          "$@" 2>&1 | tee "$QUALITY_LOG_DIR/$stage.log"
+          results=("${PIPESTATUS[@]}")
+          node -e 'const fs=require("node:fs"); const [stage,command,tee,dir]=process.argv.slice(1); fs.writeFileSync(`${dir}/${stage}-exit.json`,JSON.stringify({stage,commandExit:Number(command),teeExit:Number(tee)},null,2)+"\n",{mode:0o600,flag:"wx"});' "$stage" "${results[0]}" "${results[1]}" "$QUALITY_LOG_DIR"
+          receipt_status="$?"
+          if [ "${results[0]}" -ne 0 ]; then exit "${results[0]}"; fi
+          if [ "${results[1]}" -ne 0 ]; then exit "${results[1]}"; fi
+          exit "$receipt_status"
+          GATE
+          {
+            printf 'implementation=%s\ntree=%s\norchestration_ref=%s\n' "$SOURCE_SHA" "$SOURCE_TREE" "$GITHUB_REF"
+            git status --porcelain=v1 --untracked-files=all
+            git ls-files --stage
+            node --version
+            npm --version
+            python3 --version
+            make --version
+            g++ --version
+            nproc
+            free -b
+            df -B1 . "$RUNNER_TEMP"
+            cat /etc/os-release
+          } > "$log_root/source-and-toolchain.txt"
+          printf 'evidence_ready=true\n' >> "$GITHUB_OUTPUT"
+
+      - name: Install the documented Linux test prerequisites
+        id: prerequisites
+        timeout-minutes: 12
+        run: |
+          set -euo pipefail
+          # Same prerequisite packages as the public CI; no repository is added.
+          export DEBIAN_FRONTEND=noninteractive
+          sudo -n --preserve-env=DEBIAN_FRONTEND timeout --signal=TERM --kill-after=10s 300s apt-get update
+          sudo -n --preserve-env=DEBIAN_FRONTEND timeout --signal=TERM --kill-after=10s 300s apt-get --no-remove --no-install-recommends install -y ripgrep ffmpeg
+          {
+            rg --version
+            ffmpeg -version
+            dpkg-query -W '-f=${Package}\t${Version}\n' ripgrep ffmpeg
+            apt-cache policy ripgrep ffmpeg
+          } | tee "$QUALITY_LOG_DIR/linux-test-prerequisites.txt"
+
+      - name: Install exact locked workspace dependencies
+        id: install
+        timeout-minutes: 15
+        run: bash "$QUALITY_GATE_PATH" install npm ci
+
+      - name: Full root check
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        timeout-minutes: 25
+        run: bash "$QUALITY_GATE_PATH" check npm run check
+
+      - name: Full root tests
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        timeout-minutes: 35
+        run: bash "$QUALITY_GATE_PATH" test npm test
+
+      - name: Full root build
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        timeout-minutes: 20
+        run: bash "$QUALITY_GATE_PATH" build npm run build
+
+      - name: Full root hygiene preflight
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        timeout-minutes: 3
+        run: bash "$QUALITY_GATE_PATH" hygiene npm run hygiene:preflight
+
+      - name: Verify exact final source even after an earlier failure
+        if: ${{ always() && steps.checkout.outcome == 'success' }}
+        timeout-minutes: 3
+        run: |
+          set -uo pipefail
+          status=0
+          actual_sha="$(git rev-parse HEAD)" || status=1
+          actual_tree="$(git rev-parse 'HEAD^{tree}')" || status=1
+          test "$actual_sha" = "$SOURCE_SHA" || status=1
+          test "$actual_tree" = "$SOURCE_TREE" || status=1
+          git diff --exit-code || status=1
+          git diff --cached --exit-code || status=1
+          source_status="$(git status --porcelain=v1 --untracked-files=all)" || status=1
+          test -z "$source_status" || status=1
+          printf 'expected_sha=%s\nactual_sha=%s\nexpected_tree=%s\nactual_tree=%s\nsource_status=%s\nexit=%s\n' "$SOURCE_SHA" "$actual_sha" "$SOURCE_TREE" "$actual_tree" "$source_status" "$status"
+          if [ -n "${QUALITY_LOG_DIR:-}" ]; then
+            printf 'expected_sha=%s\nactual_sha=%s\nexpected_tree=%s\nactual_tree=%s\nsource_status=%s\nexit=%s\n' "$SOURCE_SHA" "$actual_sha" "$SOURCE_TREE" "$actual_tree" "$source_status" "$status" > "$QUALITY_LOG_DIR/final-source-guard.txt" || status=1
+          fi
+          exit "$status"
+
+      - name: Preserve original source-quality logs and exit receipts
+        if: ${{ always() && steps.prepare.outputs.evidence_ready == 'true' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: issue63-exact-source-quality-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/spaceapp63-source-quality-${{ github.run_id }}-${{ github.run_attempt }}/
+          if-no-files-found: error
