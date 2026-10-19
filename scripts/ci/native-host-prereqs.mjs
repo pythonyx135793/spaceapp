@@ -150,3 +150,28 @@ export function validateNativeEngineInfo(local, api, expected) {
     requireFact(positive(host.cpus) && positive(host.memTotal) && host.cpus >= expected.required.cpuCount && host.memTotal >= expected.required.memoryBytes, `Actual engine CPU/memory prerequisites failed (${name})`);
   }
 }
+
+// Exact existing tools from the reviewed ubuntu24/20261018.339 runner image.
+// Selection remains stable with RUSTUP_AUTO_INSTALL=0; no compiler is installed.
+export const NATIVE_TOOLCHAIN_VERSIONS = Object.freeze({ go: "go1.26.9", rustc: "1.99.1", cargo: "1.99.1" });
+
+export function validateNativeToolchain(tools) {
+  const go = words(tools?.go);
+  requireFact(go[0] === "go" && go[1] === "version" && go[2] === NATIVE_TOOLCHAIN_VERSIONS.go, "Pinned existing Go1.26.9 differs or is unobserved; safe version facts retained");
+  for (const executable of ["rustc", "cargo"]) {
+    const version = words(tools?.[executable]);
+    requireFact(version[0] === executable && version[1] === NATIVE_TOOLCHAIN_VERSIONS[executable], `Pinned existing ${executable}${NATIVE_TOOLCHAIN_VERSIONS[executable]} differs or is unobserved; safe version facts retained`);
+  }
+}
+
+export async function observeNativeToolchain(readVersion, record) {
+  const tools = {};
+  for (const [executable, args] of [["go", ["version"]], ["rustc", ["--version"]], ["cargo", ["--version"]]]) {
+    // Preserve successful partial facts, but never continue after a command or
+    // evidence-write failure. Pin rejection follows all three successful reads.
+    tools[executable] = await readVersion(executable, args);
+    await record({ ...tools });
+  }
+  validateNativeToolchain(tools);
+  return tools;
+}

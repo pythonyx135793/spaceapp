@@ -10,7 +10,7 @@ import { fileURLToPath } from "node:url";
 import { waitForTimedCommand } from "../../packages/run-spaceapp/src/command-timeout.mjs";
 import { composeCommand, composeProjectName, PROFILE_REQUIREMENTS, profileRuntimeSettings } from "../../packages/run-spaceapp/src/index.mjs";
 import { NATIVE_APT_KEYRING, nativeAptInputFacts, planOwnedNativeAptSources, readNativeAptInputs, validateNativeAptInputs } from "./native-apt-source.mjs";
-import { analyzeSubordinateRanges, NATIVE_EXECUTABLES, nativeEngineIdentity, nativeEngineResources, nativeEngineStorageFacts, nativePolicyObservation, nativeRuntimeConfig, trustedNativeFile, validateNativeDestinations, validateNativeEngineInfo, validateNativeMappings, validateNativePolicies, validateNativeSessionAndStorage } from "./native-host-prereqs.mjs";
+import { analyzeSubordinateRanges, NATIVE_EXECUTABLES, NATIVE_TOOLCHAIN_VERSIONS, observeNativeToolchain, nativeEngineIdentity, nativeEngineResources, nativeEngineStorageFacts, nativePolicyObservation, nativeRuntimeConfig, trustedNativeFile, validateNativeDestinations, validateNativeEngineInfo, validateNativeMappings, validateNativePolicies, validateNativeSessionAndStorage } from "./native-host-prereqs.mjs";
 
 const MINUTE = 60_000, GIB = 1024 ** 3, HEADROOM = 512 * 1024 ** 2;
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -245,19 +245,13 @@ async function initialize() {
   if (initialErrors.length) throw new Failure("Initial native session observations are incomplete; safe facts retained", initialErrors[0].exitCode);
   validateNativeSessionAndStorage(initialSession, process.getuid(), REQUIRED, HEADROOM);
 
-  const tools = { go: await output("go", ["version"]) };
-  await artifact("existing-toolchain.json", tools);
-  requireThat(tools.go.split(/\s+/)[2] === "go1.26.9", "Pinned existing Go1.26.9 is unavailable");
-  for (const executable of ["rustc", "cargo"]) {
-    tools[executable] = await output(executable, ["--version"]); await artifact("existing-toolchain.json", tools);
-    requireThat(tools[executable].split(/\s+/)[1] === "1.99.0", `Pinned existing ${executable}1.99.0 is unavailable`);
-  }
+  await artifact("source-pins.json", { sources: SOURCES, assets: ASSETS, aptKeyring: NATIVE_APT_KEYRING, nativeDependencies: NATIVE_DEPS, toolchain: NATIVE_TOOLCHAIN_VERSIONS, engine: "6.1.4", provider: "2.40.0", runnerImage: process.env.ImageVersion ?? null, runnerOS: osRelease, appArmorLimitation: "Upstream Podman6.1.4 rootless skips default per-container AppArmor and rejects explicit profiles; vendor executable namespace policy remains enabled. No per-container AppArmor confinement is claimed." });
+  const tools = await observeNativeToolchain(output, (facts) => artifact("existing-toolchain.json", facts));
   for (const executable of ["gcc-13", "g++-13", "git", "make", "curl", "pkg-config", "python3"]) tools[executable] = await output(executable, ["--version"]);
   await artifact("existing-toolchain.json", tools);
   const container = await command("systemd-detect-virt", ["--container"], { capture: true, allowFailure: true });
   requireThat(container.code === 1 && container.output === "none", "Nested container provisioning cannot replace the native Ubuntu runner");
   requireThat(Number((await statfs("/sys/fs/cgroup")).type) === 0x63677270, "The native cgroup filesystem is not cgroupv2");
-  await artifact("source-pins.json", { sources: SOURCES, assets: ASSETS, aptKeyring: NATIVE_APT_KEYRING, nativeDependencies: NATIVE_DEPS, engine: "6.1.4", provider: "2.40.0", runnerImage: process.env.ImageVersion ?? null, runnerOS: osRelease, appArmorLimitation: "Upstream Podman6.1.4 rootless skips default per-container AppArmor and rejects explicit profiles; vendor executable namespace policy remains enabled. No per-container AppArmor confinement is claimed." });
   await resources("before-build", state.build, 10 * GIB);
 }
 
