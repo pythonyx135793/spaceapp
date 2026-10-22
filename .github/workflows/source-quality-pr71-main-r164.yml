@@ -62,11 +62,13 @@ jobs:
           uname -a
           node --version
           npm --version
-          if ! command -v rg >/dev/null 2>&1; then
+          if ! command -v rg >/dev/null 2>&1 || ! test -x /usr/bin/ffmpeg; then
             sudo apt-get update -qq
-            sudo apt-get install -y -qq --no-install-recommends ripgrep
+            sudo apt-get install -y -qq --no-install-recommends ripgrep ffmpeg
           fi
           rg --version
+          test -x /usr/bin/ffmpeg
+          /usr/bin/ffmpeg -version
 
       - name: Install locked dependencies
         id: install
