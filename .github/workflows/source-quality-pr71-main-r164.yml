@@ -1,0 +1,125 @@
+name: PR 71 current-main merge full-source validation
+
+on:
+  push:
+    branches: [codex/pr71-main-validation-r164]
+    paths: [.github/workflows/source-quality-pr71-main-r164.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: source-quality-pr71-main-r164
+  cancel-in-progress: false
+
+jobs:
+  request-parentage-validation:
+    if: >-
+      github.repository == 'pythonyx135793/spaceapp' &&
+      github.event.repository.private == false &&
+      github.ref == 'refs/heads/codex/pr71-main-validation-r164'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+      NO_COLOR: '1'
+    steps:
+      - name: Check out exact root-reviewed functional candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: pythonyx135793/spaceapp
+          ref: bcddc4ca9974e8e80f6fd123c78621aa107cbbde
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Verify immutable clean source
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = 'bcddc4ca9974e8e80f6fd123c78621aa107cbbde'
+          test "$(git rev-parse HEAD:apps/worker/src/workflow-tracing.ts)" = '8afa0c17d9cb0aa03f7f180f4138e80dcc170bf9'
+          test "$(git rev-parse HEAD:apps/worker/tests/workflow-tracing.test.ts)" = 'fa46b09078e365446c005a9904f9fd63331fd0f8'
+          test "$(git rev-parse HEAD:apps/worker/tests/otlp-tracing.integration.test.ts)" = 'f127094f16a5033ea0b5f24470de60584b7865e1'
+          test "$(git rev-parse HEAD:docs/configuration-reference.md)" = 'ff817ea6475ded0b5333744e875441e783fe9093'
+          test "$(git rev-parse HEAD:docs/quality/observability.md)" = '77113d8506c731af24dbd78044a33934ebe456f0'
+          test "$(git rev-parse HEAD:apps/worker/src/tracing-protocol.ts)" = '0f24dc04740ca9fa70d9731aa33cfd2b009ba6f2'
+          test "$(git rev-parse HEAD:apps/worker/src/worker-tracing.ts)" = '7aaeb2a46e94b40f816ae0b3d597b2d7ccc9763d'
+          test "$(git rev-parse HEAD:packages/runtime/src/otlp-span-exporter.ts)" = 'd24a1f874e3750dea604c61d7c75bb5f6e3183a3'
+          test "$(git rev-parse HEAD:packages/observability/src/otlp-span-exporter.ts)" = '090729d74749e3a694baed58395c42a41e663ac2'
+          test "$(git rev-parse HEAD:apps/web/src/features/clipboard-dock/ClipboardDock.tsx)" = 'ce517f6c884c010225ba506868fdeb56a1ec06ee'
+          test -z "$(git status --porcelain)"
+
+      - name: Use source-required Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version-file: .nvmrc
+
+      - name: Verify environment and required tooling
+        shell: bash
+        run: |
+          test "$(node --version)" = "v$(tr -d '\r\n' < .nvmrc)"
+          test "$(npm --version)" = '10.9.8'
+          printf 'ImageOS=%s ImageVersion=%s CI=%s\n' "$ImageOS" "$ImageVersion" "$CI"
+          uname -a
+          node --version
+          npm --version
+          if ! command -v rg >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq --no-install-recommends ripgrep
+          fi
+          rg --version
+
+      - name: Install locked dependencies
+        id: install
+        run: npm ci --no-audit --no-fund
+
+      - name: Full unchanged check
+        id: check
+        run: npm run check
+
+      - name: Focused ClipboardDock timer lifecycle regressions
+        run: npm test -w @space/web -- tests/clipboard-dock.test.tsx -t 'copy feedback'
+
+      - name: Shared transport and runtime compatibility regressions
+        run: |
+          npm test -w @space/observability
+          npm test -w @space/runtime -- tests/otlp-span-exporter.test.ts
+
+      - name: Memory worker tracing and deployed reload lifecycle
+        run: npm test -w @space/worker -- tests/memory-worker-tracing-lifecycle.test.ts tests/deployed-code-reload.test.ts
+
+      - name: Worker tracing and real Temporal HTTP collector replay integration
+        id: tracing
+        run: >-
+          npm test -w @space/worker --
+          tests/activity-observability.test.ts
+          tests/worker-tracing-host.test.ts
+          tests/workflow-tracing.test.ts
+          tests/workflow-tracing-protocol.test.ts
+          tests/otlp-tracing.integration.test.ts
+          tests/otlp-api-trace.integration.test.ts
+
+      - name: Complete API request and direct memory coordinator correlation tests
+        id: api-correlation
+        run: >-
+          npm test -w @space/api --
+          tests/trace-correlation.test.ts
+          tests/memory-consolidation-coordinator.test.ts
+          tests/memory-mutation-coordinator.test.ts
+
+      - name: One full-root test invocation on exact candidate
+        id: test
+        run: npm test
+
+      - name: Full build
+        if: ${{ !cancelled() && steps.check.outcome == 'success' }}
+        run: npm run build
+
+      - name: Hygiene and immutable-source readback
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        shell: bash
+        run: |
+          npm run hygiene:preflight
+          test "$(git rev-parse HEAD)" = 'bcddc4ca9974e8e80f6fd123c78621aa107cbbde'
+          test -z "$(git status --porcelain)"
+          git diff --check
+          printf 'Agent-triggered validation of root-reviewed sourcebcddc4ca; no new owner review or maintainer acceptance is implied. One exact-source full-root invocation; no added retries (stock web CI retry 2 unchanged), cache, artifact uploads, hook instrumentation, assertion weakening, or timeout increases. Historical Windows path failure and earlier failures/skips remain separate evidence.\n' >> "$GITHUB_STEP_SUMMARY"
