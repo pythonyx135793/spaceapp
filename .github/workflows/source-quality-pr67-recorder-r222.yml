@@ -1,0 +1,162 @@
+name: PR 67 history recorder full-source validation
+
+on:
+  push:
+    branches: [codex/source-quality-pr67-recorder-r222]
+    paths: [.github/workflows/source-quality-pr67-recorder-r222.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: source-quality-pr67-recorder-r222
+  cancel-in-progress: false
+
+jobs:
+  recorder-validation:
+    if: >-
+      github.repository == 'pythonyx135793/spaceapp' &&
+      github.event.repository.private == false &&
+      github.ref == 'refs/heads/codex/source-quality-pr67-recorder-r222'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+      NO_COLOR: '1'
+    steps:
+      - name: Check out exact application source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: pythonyx135793/spaceapp
+          ref: 70f0b4e6c5ad4f40fc4a78eda0fa8534e5fbc56e
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Verify immutable clean source
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = '70f0b4e6c5ad4f40fc4a78eda0fa8534e5fbc56e'
+          test "$(git rev-parse 'HEAD^{tree}')" = 'a80ec4cdc37fc41769bd90956ac7713f775c9b0c'
+          test -z "$(git status --porcelain)"
+          test "$(find apps/worker/tests/fixtures/workflow-histories -maxdepth 1 -name '*.json' | wc -l)" -eq 51
+
+      - name: Use source-required Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version-file: .nvmrc
+
+      - name: Verify environment and required tooling
+        shell: bash
+        run: |
+          test "$(node --version)" = "v$(tr -d '\r\n' < .nvmrc)"
+          test "$(npm --version)" = '10.9.8'
+          printf 'ImageOS=%s ImageVersion=%s CI=%s\n' "$ImageOS" "$ImageVersion" "$CI"
+          uname -a
+          node --version
+          npm --version
+          if ! command -v rg >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq --no-install-recommends ripgrep
+          fi
+          rg --version
+
+      - name: Install locked dependencies
+        id: install
+        run: npm ci --no-audit --no-fund
+
+      - name: Full check
+        id: check
+        run: npm run check
+
+      - name: One full-root test invocation on exact source
+        id: test
+        shell: bash
+        run: |
+          set -o pipefail
+          npm test 2>&1 | tee "$RUNNER_TEMP/full-root-test.log"
+
+      - name: Confirm normal sandbox duration from the full-root run
+        if: ${{ !cancelled() && steps.test.outcome == 'success' }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os, re
+          from pathlib import Path
+          text = (Path(os.environ['RUNNER_TEMP']) / 'full-root-test.log').read_text()
+          text = re.sub(r'\x1b\[[0-9;]*m', '', text)
+          matches = re.findall(r'tests/temporal-sandbox.integration.test\.ts \(23 tests\)\s+(\d+)ms', text)
+          assert len(matches) == 1, matches
+          milliseconds = int(matches[0])
+          assert milliseconds < 180000, milliseconds
+          assert re.search(r'tests/temporal-history-store.test\.ts \(10 tests\)', text), 'Recorder regressions missing'
+          summary = f'Normal full-root sandbox/replay: 23 passed in {milliseconds}ms; recorder filesystem regressions: 10 passed.\n'
+          print(summary)
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as file:
+              file.write(summary)
+          PY
+
+      - name: Real opt-in recorder on an isolated copy of all 51 histories
+        id: recorder
+        shell: bash
+        run: |
+          set -o pipefail
+          recording_root=$(mktemp -d "$RUNNER_TEMP/temporal-recorder-r222.XXXXXX")
+          export RECORDING_ROOT="$recording_root"
+          python3 - <<'PY'
+          import hashlib, json, os, shutil
+          from pathlib import Path
+          source = Path('apps/worker/tests/fixtures/workflow-histories')
+          root = Path(os.environ['RECORDING_ROOT'])
+          copied = root / 'corpus'
+          copied.mkdir()
+          original = sorted(source.glob('*.json'))
+          assert len(original) == 51
+          manifest = {}
+          for path in original:
+              manifest[path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
+              shutil.copyfile(path, copied / path.name)
+          (root / 'original-hashes.json').write_text(json.dumps(manifest, sort_keys=True))
+          print('Prepared isolated corpus: 51 original histories; committed corpus untouched.')
+          PY
+          npm run temporal:record-histories -w @space/worker -- --version validation-r222 --output-dir "$recording_root/corpus" 2>&1 | tee "$RUNNER_TEMP/recorder-path.log"
+          python3 - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          root = Path(os.environ['RECORDING_ROOT'])
+          copied = root / 'corpus'
+          source = Path('apps/worker/tests/fixtures/workflow-histories')
+          manifest = json.loads((root / 'original-hashes.json').read_text())
+          for name, digest in manifest.items():
+              assert hashlib.sha256((copied / name).read_bytes()).hexdigest() == digest, name
+              assert hashlib.sha256((source / name).read_bytes()).hexdigest() == digest, name
+          additions = {f'{Path(name).stem}--validation-r222.json' for name in manifest}
+          actual = {path.name for path in copied.glob('*.json')}
+          assert actual == set(manifest) | additions, (actual, additions)
+          for name in additions:
+              data = json.loads((copied / name).read_text())
+              assert data['workflowId'] and data['history']['events'], name
+          log = (Path(os.environ['RUNNER_TEMP']) / 'recorder-path.log').read_text()
+          marker = 'Replayed 51 existing histories successfully before recording any additions.'
+          assert marker in log
+          assert '23 passed' in log
+          print('Real recorder passed: pre-write replay51, additive51 versioned histories, retained+added replay102, negative control; original51 bytes unchanged in copied and committed corpora.')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as file:
+              file.write('Isolated recorder: original51 preserved; new51 versioned histories; retained+added102 real replay passed.\n')
+          PY
+          test -z "$(git status --porcelain)"
+
+      - name: Full build
+        id: build
+        if: ${{ !cancelled() && steps.check.outcome == 'success' }}
+        run: npm run build
+
+      - name: Hygiene and immutable-source readback
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        shell: bash
+        run: |
+          npm run hygiene:preflight
+          test "$(git rev-parse HEAD)" = '70f0b4e6c5ad4f40fc4a78eda0fa8534e5fbc56e'
+          test "$(git rev-parse 'HEAD^{tree}')" = 'a80ec4cdc37fc41769bd90956ac7713f775c9b0c'
+          test -z "$(git status --porcelain)"
+          git diff --check
+          printf 'Application source: 70f0b4e6c5ad4f40fc4a78eda0fa8534e5fbc56e. Scope: full check, one full-root test invocation, isolated real recorder, build and hygiene. See each step result and logs for failures and skipped tests. Existing web CI retries are unchanged. Earlier results remain separate evidence.\n' >> "$GITHUB_STEP_SUMMARY"
