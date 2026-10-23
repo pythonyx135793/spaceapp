@@ -1,3 +1,4 @@
+# Application checkout is pinned below; workflow-only updates do not change the tested source.
 name: PR 67 history recorder full-source validation
 
 on:
