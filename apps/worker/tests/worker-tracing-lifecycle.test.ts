@@ -4,6 +4,7 @@ const mocks = vi.hoisted(() => ({
   background: false,
   connect: vi.fn(), create: vi.fn(), run: vi.fn(), tracing: vi.fn(), close: vi.fn(),
   metricsListen: vi.fn(), metricsStart: vi.fn(), chessStart: vi.fn(), chessClose: vi.fn(),
+  nousRun: vi.fn(), nousValidate: vi.fn(),
   telegramStart: vi.fn(), telegramStop: vi.fn(), streamingStart: vi.fn(), streamingStop: vi.fn(),
   options: { interceptors: { activity: [] }, sinks: { tracing: {} } }
 }));
@@ -39,7 +40,8 @@ vi.mock("../src/streaming-bot-runtime.js", () => ({
 }));
 vi.mock("../src/chess-cli-move.js", () => ({ CHESS_MOVE_SOCKET: "unused", startChessMoveServer: mocks.chessStart }));
 vi.mock("../src/nous-turn.js", () => ({
-  NOUS_TURN_MAX_BODY_BYTES: 1, NousTurnInputError: class extends Error {}, runNousTurn: vi.fn(), validateNousTurnInput: vi.fn()
+  NOUS_TURN_MAX_BODY_BYTES: 1, NousTurnInputError: class extends Error {},
+  runNousTurn: mocks.nousRun, validateNousTurnInput: mocks.nousValidate
 }));
 
 beforeEach(() => {
@@ -70,6 +72,35 @@ describe("main worker tracing lifetime", () => {
     expect(mocks.chessClose).toHaveBeenCalledTimes(1);
     expect(mocks.close).toHaveBeenCalledTimes(1);
     expect(mocks.run.mock.invocationCallOrder[0]).toBeLessThan(mocks.close.mock.invocationCallOrder[0]);
+  });
+
+  it("forwards streamed Nous turn events while retaining worker cleanup", async () => {
+    const body = { text: "synthetic request" };
+    const validated = { text: "validated synthetic request" };
+    const signal = new AbortController().signal;
+    const event = { type: "text", text: "synthetic streamed output" };
+    const result = { status: "completed" };
+    const emit = vi.fn();
+    mocks.nousValidate.mockReturnValue(validated);
+    mocks.nousRun.mockImplementation(async (_input, _signal, forward) => {
+      forward?.(event);
+      return result;
+    });
+    mocks.run.mockImplementation(async () => {
+      const routes = mocks.chessStart.mock.calls[0][2];
+      await expect(routes["/nous-turn"].handle(body, signal, emit)).resolves.toBe(result);
+      expect(emit).toHaveBeenCalledWith(event);
+      expect(mocks.close).not.toHaveBeenCalled();
+    });
+
+    await load();
+
+    expect(mocks.nousValidate).toHaveBeenCalledWith(body);
+    expect(mocks.nousRun).toHaveBeenCalledWith(validated, signal, emit);
+    expect(emit).toHaveBeenCalledTimes(1);
+    expect(mocks.chessClose).toHaveBeenCalledTimes(1);
+    expect(mocks.close).toHaveBeenCalledTimes(1);
+    expect(mocks.nousRun.mock.invocationCallOrder[0]).toBeLessThan(mocks.chessClose.mock.invocationCallOrder[0]);
   });
 
   it("closes tracing and preserves the error when worker creation rejects", async () => {
