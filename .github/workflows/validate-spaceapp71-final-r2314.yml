@@ -1,0 +1,99 @@
+# Prior check/build/negative-control passes retained from40554079919; only two strict Node-test expectations changed.
+name: SpaceApp tracing corrected-source full tests R2314
+on:
+  push:
+    branches: [codex/proof-spaceapp71-final-r2314]
+permissions:
+  contents: read
+env:
+  ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+  SOURCE_HEAD: "89f5efec8561afbf3f5a587ffdffade3e075b6cb"
+  SOURCE_TREE: "fa8ff7c83ed47091660d7b3436691cebfdf674e5"
+  SOURCE_MANIFEST: "77b939028c496e7b5b17a94f15a601cec9973c94fa266fcb13aa882364d24c5d"
+  SOURCE_WORKER: "5151abefb1ae19ebb8ded3b3088a0f825ab91c4da26fa69d073b53409c1ed1fa"
+  OLD_WORKER: "43c5420e88b705ff67c85ce39fa388ffddd07b432e73d4702468b615b9d41e39"
+jobs:
+  integration:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    defaults:
+      run:
+        working-directory: application
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 89f5efec8561afbf3f5a587ffdffade3e075b6cb
+          path: application
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version-file: application/.nvmrc
+          cache: npm
+          cache-dependency-path: application/package-lock.json
+      - name: Verify exact frozen application bytes and environment
+        id: source
+        run: |
+          mkdir -p "$RUNNER_TEMP/spaceapp71-r2314-final"
+          git rev-parse HEAD
+          git rev-parse 'HEAD^{tree}'
+          test "$(git rev-parse HEAD)" = "$SOURCE_HEAD"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$SOURCE_TREE"
+          node --version
+          npm --version
+          uname -a
+          cat > "$RUNNER_TEMP/spaceapp71-r2314-final/source-guard.py" <<'PY'
+          import hashlib,json,os,pathlib,subprocess
+          root=pathlib.Path.cwd(); files=[]
+          entries=subprocess.check_output(['git','ls-tree','-r','-z','HEAD']).split(b'\0')
+          for entry in entries:
+              if not entry: continue
+              meta,name=entry.split(b'\t',1); mode,kind,oid=meta.decode().split()
+              assert kind=='blob'
+              name=name.decode(); path=root/name
+              raw=os.readlink(path).encode() if path.is_symlink() else path.read_bytes()
+              assert hashlib.sha1(b'blob '+str(len(raw)).encode()+b'\0'+raw).hexdigest()==oid,name
+              files.append({'path':name,'mode':mode,'git_blob':oid,'bytes':len(raw),'sha256':hashlib.sha256(raw).hexdigest()})
+          files.sort(key=lambda x:x['path'])
+          digest=hashlib.sha256(json.dumps(files,sort_keys=True,separators=(',',':'),ensure_ascii=True).encode()).hexdigest()
+          assert digest==os.environ['SOURCE_MANIFEST'],digest
+          print(json.dumps({'source_files':len(files),'source_bytes':sum(x['bytes'] for x in files),'manifest_sha256':digest}))
+          PY
+          python3 "$RUNNER_TEMP/spaceapp71-r2314-final/source-guard.py"
+      - name: Locked dependency installation
+        id: install
+        run: npm ci --no-audit --no-fund
+      - name: Ensure real file-search test prerequisite
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: |
+          if ! command -v rg >/dev/null; then sudo apt-get update -qq && sudo apt-get install -y -qq ripgrep; fi
+          rg --version
+      - name: Full repository tests including real Temporal collector and replay
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: |
+          npm test 2>&1 | tee "$RUNNER_TEMP/spaceapp71-r2314-final/root-tests.log"
+      - name: Hygiene and final immutable source guard
+        if: ${{ !cancelled() && steps.source.outcome == 'success' }}
+        run: |
+          npm run hygiene:preflight 2>&1 | tee "$RUNNER_TEMP/spaceapp71-r2314-final/hygiene.log"
+          git diff --exit-code
+          git diff --cached --exit-code
+          test -z "$(git status --porcelain=v1)"
+          python3 "$RUNNER_TEMP/spaceapp71-r2314-final/source-guard.py"
+      - name: Summarize actual results and evidence hashes
+        if: ${{ !cancelled() }}
+        run: |
+          python3 - <<'PY'
+          import hashlib,json,os,pathlib,re
+          p=pathlib.Path(os.environ['RUNNER_TEMP'])/'spaceapp71-r2314-final'
+          for f in sorted(p.glob('*.log')):
+              raw=f.read_bytes(); text=re.sub(r'\x1b\[[0-9;]*m','',raw.decode('utf-8','replace'))
+              lines=[s for s in text.splitlines() if re.search(r'Test Files|Tests\s+\d|^# (?:pass|fail|skipped|tests)|^not ok|^ FAIL |^Failed Tests|^Error:',s)]
+              print(json.dumps({'file':f.name,'bytes':len(raw),'sha256':hashlib.sha256(raw).hexdigest(),'summary_lines':lines}))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: spaceapp71-r2314-final-exact-source
+          path: ${{ runner.temp }}/spaceapp71-r2314-final
+          retention-days: 14
